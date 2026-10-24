@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rco-mlx"
+version = "0.1.0"
+description = "RCO budget-constrained mixed-precision allocation ported to NumPy, with MLX config emission"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Hermit Dave" }]
+keywords = ["quantization", "mixed-precision", "mlx", "rco", "llm"]
+dependencies = ["numpy>=1.24"]
+
+[project.optional-dependencies]
+mlx = ["mlx>=0.20"]
+test = ["pytest>=7"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
