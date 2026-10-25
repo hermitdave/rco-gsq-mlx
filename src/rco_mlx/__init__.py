@@ -58,6 +58,7 @@ from .mlx_alloc import (
     recover_bits_from_packed_shape,
     write_config,
 )
+from .model_adapters import FlintAdapter, LFM2Adapter, get, register, ModelAdapter
 from .objective import (
     MLX_SUPPORTED_BITS,
     MLX_SUPPORTED_GROUP_SIZES,
@@ -109,6 +110,12 @@ __all__ = [
     "dequantize_exact_width",
     "gsq_to_mlx_affine",
     "quantize_to_mlx_affine",
+    # adapters
+    "ModelAdapter",
+    "FlintAdapter",
+    "LFM2Adapter",
+    "get",
+    "register",
     # validation
     "ValidationReport",
     "validate_allocation",
