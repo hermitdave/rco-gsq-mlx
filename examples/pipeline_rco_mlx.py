@@ -1,0 +1,458 @@
+#!/usr/bin/env python3
+"""
+RCO mixed-precision quantization pipeline for MLX.
+
+End-to-end: introspect model -> measure losses -> RCO allocation ->
+emit MLX config -> validate -> stream quantize.
+
+Usage:
+    # With a pre-computed imatrix + GGUF weights:
+    python pipeline_rco_mlx.py \
+        --source /path/to/bf16-model \
+        --output /path/to/output \
+        --imatrix imatrix.gguf \
+        --gguf-dir gguf-quant \
+        --target-bpw 4.0 \
+        --group-size 64
+
+    # With a pre-built loss table JSON:
+    python pipeline_rco_mlx.py \
+        --source /path/to/bf16-model \
+        --output /path/to/output \
+        --loss-table work/imatrix_alloc.json \
+        --target-bpw 4.0 \
+        --group-size 64
+
+The loss table JSON is the output of imatrix_importance.py:
+    [{"layer": 0, "tensor": "ffn_down_exps", "params": 123456, "mse": {"2": 1.2, "3": 0.8, ...}}, ...]
+"""
+
+import argparse
+import json
+import sys
+import time
+from pathlib import Path
+
+import numpy as np
+
+# ---------------------------------------------------------------------------
+# rco-mlox imports (installed via `pip install -e ~/Projects/rco-mlx`)
+# ---------------------------------------------------------------------------
+from rco_mlx import (
+    LossTable,
+    MlxQuantConfig,
+    allocation_to_config,
+    attach_param_counts,
+    build_layer_groups,
+    effective_bits,
+    validate_allocation,
+    write_config,
+)
+from rco_mlx.search import budget_dp, values_from_losses
+
+
+# ---------------------------------------------------------------------------
+# Step 1: introspect the source model and build layer groups
+# ---------------------------------------------------------------------------
+def introspect_model(source_dir: Path, group_spec: str | None = None):
+    """Return (layer_names, param_counts, groups) from a BF16 safetensors dir."""
+    import safetools  # noqa – we use the raw mmap reader below
+
+    from safetensors import safe_open
+
+    # discover shards
+    shards = sorted(source_dir.glob("*.safetensors"))
+    if not shards:
+        sys.exit(f"No safetensors shards in {source_dir}")
+
+    # read the first shard's index to get all keys + shapes
+    index_path = source_dir / "model.safetensors.index.json"
+    if index_path.exists():
+        with open(index_path) as f:
+            index = json.load(f)
+        weight_map = index["weight_map"]
+        # collect unique module paths (strip .weight suffix)
+        module_paths = set()
+        for key in weight_map:
+            if key.endswith(".weight"):
+                module_paths.add(key[: -len(".weight")])
+            elif key.endswith(".scales") or key.endswith(".biases"):
+                continue
+            else:
+                module_paths.add(key)
+        layer_names = sorted(module_paths)
+    else:
+        # fallback: read the first shard's keys
+        with safe_open(str(shards[0]), framework="pt", device="cpu") as f:
+            layer_names = sorted(
+                k[: -len(".weight")] if k.endswith(".weight") else k
+                for k in f.keys()
+                if not k.endswith(".scales") and not k.endswith(".biases")
+            )
+
+    # param counts from the first shard (enough for fractions)
+    param_counts = {}
+    with safe_open(str(shards[0]), framework="pt", device="cpu") as f:
+        for key in f.keys():
+            shape = f.get_tensor(key).shape
+            param_counts[key] = int(np.prod(shape))
+
+    # build groups
+    group_patterns = None
+    if group_spec:
+        # parse "pat1,pat2 pat3 pat4,pat5" → [[pat1,pat2], [pat3], [pat4,pat5]]
+        group_patterns = [
+            [p.strip() for p in group.split(",") if p.strip()]
+            for group in group_spec.strip().split()
+            if group.strip()
+        ]
+
+    groups = build_layer_groups(layer_names, group_patterns)
+    attach_param_counts(groups, param_counts)
+
+    return layer_names, param_counts, groups
+
+
+# ---------------------------------------------------------------------------
+# Step 2: build the loss table
+# ---------------------------------------------------------------------------
+def build_loss_table_from_imatrix(
+    imatrix_path: Path,
+    gguf_dir: Path,
+    layers: list[int],
+    which: list[str],
+    bits_list: list[int],
+    group_size: int,
+    out: Path,
+):
+    """Run imatrix_importance to produce the loss-table JSON."""
+    import subprocess
+
+    script = (
+        Path(__file__).parent.parent.parent.parent
+        / "skills/mlops/streaming-mixed-precision-quantization/scripts/imatrix_importance.py"
+    )
+    if not script.exists():
+        # fall back to the installed script location
+        script = Path(
+            "~/.hermes/profiles/helix/skills/mlops/streaming-mixed-precision-quantization/scripts/imatrix_importance.py"
+        ).expanduser()
+
+    cmd = [
+        sys.executable,
+        str(script),
+        "--imatrix", str(imatrix_path),
+        "--gguf-dir", str(gguf_dir),
+        "--layers", ",".join(str(l) for l in layers),
+        "--which", ",".join(which),
+        "--bits", ",".join(str(b) for b in bits_list),
+        "--group-size", str(group_size),
+        "--out", str(out),
+    ]
+    print(f"[measure] running imatrix sweep …")
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        sys.exit(f"imatrix sweep failed:\n{result.stderr}")
+    print(result.stdout)
+    return out
+
+
+def load_loss_table(path: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Load the imatrix_importance JSON and return (losses, fracs, bitwidths)."""
+    rows = json.loads(path.read_text())
+    if not rows:
+        sys.exit(f"Empty loss table: {path}")
+
+    # infer bitwidths from the first row
+    bitwidths = np.array([int(b) for b in rows[0]["mse"].keys()], dtype=np.int64)
+
+    # build a lookup: (layer, tensor) → {bits: mse}
+    lookup = {}
+    for r in rows:
+        lookup[(r["layer"], r["tensor"])] = {int(b): v for b, v in r["mse"].items()}
+
+    # collect groups from rows
+    groups = sorted({(r["layer"], r["tensor"]) for r in rows})
+
+    losses = np.array(
+        [[lookup[g][b] for b in bitwidths] for g in groups],
+        dtype=np.float64,
+    )
+    params = np.array(
+        [next(r["params"] for r in rows if (r["layer"], r["tensor"]) == g) for g in groups],
+        dtype=np.float64,
+    )
+    fracs = params / params.sum()
+
+    return losses, fracs, bitwidths
+
+
+# ---------------------------------------------------------------------------
+# Step 3: RCO allocation
+# ---------------------------------------------------------------------------
+def run_rco_allocation(
+    losses: np.ndarray,
+    fracs: np.ndarray,
+    bitwidths: np.ndarray,
+    target_bpw: float,
+    group_size: int,
+    group_names: list[str],
+) -> tuple[dict[str, int], dict]:
+    """Run the RCO knapsack DP and return (assignment, report)."""
+    table = LossTable(
+        losses=losses,
+        fracs=fracs,
+        bitwidths=bitwidths,
+        group_size=group_size,
+    )
+    report = table.report(target_avg_bits=target_bpw)
+    bits_per_group = table.assignment(target_avg_bits=target_bpw)
+
+    assignment = {name: int(b) for name, b in zip(group_names, bits_per_group)}
+    return assignment, report
+
+
+# ---------------------------------------------------------------------------
+# Step 4: emit + validate MLX config
+# ---------------------------------------------------------------------------
+def emit_and_validate(
+    assignment: dict[str, int],
+    group_size: int,
+    source_dir: Path,
+    output_dir: Path,
+    default_bits: int = 4,
+) -> MlxQuantConfig:
+    """Write config.json and validate before loading."""
+    cfg = allocation_to_config(
+        assignment,
+        default_bits=default_bits,
+        group_size=group_size,
+        mode="affine",
+    )
+
+    # load base config from source
+    base_cfg_path = source_dir / "config.json"
+    base_cfg = json.loads(base_cfg_path.read_text()) if base_cfg_path.exists() else {}
+
+    # write to output
+    out_cfg_path = output_dir / "config.json"
+    merged = write_config(cfg, out_cfg_path, base_config=base_cfg)
+
+    # gather on-disk keys from the output dir's index (or source)
+    index_path = output_dir / "model.safetensors.index.json"
+    if not index_path.exists():
+        index_path = source_dir / "model.safetensors.index.json"
+    on_disk_keys = []
+    if index_path.exists():
+        idx = json.loads(index_path.read_text())
+        on_disk_keys = list(idx.get("weight_map", {}).keys())
+
+    report = validate_allocation(cfg, on_disk_keys=on_disk_keys)
+    print(report.summary())
+    if not report.ok:
+        sys.exit("Validation failed — fix the config before loading.")
+    return cfg
+
+
+# ---------------------------------------------------------------------------
+# Step 5: streaming quantize
+# ---------------------------------------------------------------------------
+def stream_quantize(
+    source_dir: Path,
+    output_dir: Path,
+    assignment: dict[str, int],
+    group_size: int,
+):
+    """Stream through the BF16 source, quantize per the allocation, write shards."""
+    import torch
+    from safetensors.torch import save_file
+
+    from rco_mlx.mlx_alloc import MlxQuantConfig
+
+    cfg = allocation_to_config(assignment, group_size=group_size)
+    layer_bits = {}
+    for path, bits in assignment.items():
+        # strip any .weight suffix for the lookup
+        clean = path.removesuffix(".weight")
+        layer_bits[clean] = bits
+
+    # also build a lookup with .weight suffix for key matching
+    layer_bits_with_suffix = {}
+    for path, bits in assignment.items():
+        if not path.endswith(".weight"):
+            layer_bits_with_suffix[path + ".weight"] = bits
+        layer_bits_with_suffix[path] = bits
+
+    def map_key_to_mlx(key: str) -> str | None:
+        if key.startswith("model.visual.") or key.startswith("visual."):
+            return None
+        if key.startswith("model.language_model."):
+            return "language_model.model." + key[len("model.language_model."):]
+        return key
+
+    def should_quantize(mlx_key: str) -> tuple[bool, int]:
+        if (
+            "norm" in mlx_key
+            or "embed" in mlx_key
+            or "lm_head" in mlx_key
+            or "mtp" in mlx_key
+            or "gate_proj" in mlx_key
+            or not mlx_key.endswith(".weight")
+            or mlx_key.endswith(".bias")
+        ):
+            return False, 4
+
+        # check the assignment
+        bits = layer_bits_with_suffix.get(mlx_key)
+        if bits is None:
+            # try without .weight
+            base = mlx_key[: -len(".weight")]
+            bits = layer_bits.get(base, 4)
+        return True, bits
+
+    shards = sorted(source_dir.glob("*.safetensors"))
+    output_dir.mkdir(parents=True, exist_ok=True)
+    total_tensors = 0
+    start = time.time()
+
+    for i, shard_path in enumerate(shards):
+        print(f"\n[quant] shard {i+1}/{len(shards)}: {shard_path.name}")
+        results = {}
+        with safe_open(str(shard_path), framework="pt", device="cpu") as f:
+            for key in f.keys():
+                mlx_key = map_key_to_mlx(key)
+                if mlx_key is None:
+                    results[key] = f.get_tensor(key).to(torch.bfloat16)
+                    continue
+
+                q_ok, bits = should_quantize(mlx_key)
+                if q_ok:
+                    tensor = f.get_tensor(key)
+                    if tensor.ndim == 2:
+                        import mlx.core as mx
+
+                        w = mx.array(tensor.float().numpy())
+                        q, scales, biases = mx.quantize(
+                            w, bits=bits, group_size=group_size
+                        )
+                        mx.eval(q, scales, biases)
+                        results[mlx_key] = torch.from_numpy(
+                            np.array(q).astype(np.uint32)
+                        )
+                        results[f"{mlx_key}.scales"] = torch.from_numpy(
+                            np.array(scales).astype(np.float16)
+                        )
+                        results[f"{mlx_key}.biases"] = torch.from_numpy(
+                            np.array(biases).astype(np.float16)
+                        )
+                    else:
+                        results[mlx_key] = tensor.to(torch.bfloat16)
+                else:
+                    results[mlx_key] = f.get_tensor(key).to(torch.bfloat16)
+
+        out_shard = output_dir / f"model-{i+1:05d}-of-{len(shards):05d}.safetensors"
+        save_file(results, str(out_shard))
+        total_tensors += len(results)
+        elapsed = time.time() - start
+        print(f"  saved {len(results)} tensors | {elapsed:.1f}s elapsed")
+
+    # copy non-weight files
+    import shutil
+
+    for f in source_dir.iterdir():
+        if f.suffix == ".safetensors" or f.name == "model.safetensors.index.json":
+            continue
+        dest = output_dir / f.name
+        if f.is_file() and not dest.exists():
+            shutil.copy2(f, dest)
+
+    print(f"\n[quant] done — {total_tensors} tensors, {time.time()-start:.1f}s total")
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+def main():
+    ap = argparse.ArgumentParser(
+        description="RCO mixed-precision quantization pipeline for MLX",
+    )
+    ap.add_argument("--source", required=True, help="BF16 source model dir")
+    ap.add_argument("--output", required=True, help="Output quantized model dir")
+    ap.add_argument("--target-bpw", type=float, required=True, help="Target bits per weight")
+    ap.add_argument("--group-size", type=int, default=64)
+    ap.add_argument("--default-bits", type=int, default=4)
+    ap.add_argument("--group-spec", default=None, help="Layer grouping spec (see build_layer_groups)")
+    ap.add_argument("--loss-table", default=None, help="Pre-built loss table JSON (skip imatrix)")
+    ap.add_argument("--imatrix", default=None, help="Imatrix GGUF path")
+    ap.add_argument("--gguf-dir", default=None, help="GGUF dir for dequantization")
+    ap.add_argument("--layers", default="0,8,16,24,32,40,47", help="Layers to sweep")
+    ap.add_argument("--which", default="ffn_down_exps,ffn_gate_exps,attn_qkv")
+    ap.add_argument("--bits", default="2,3,4,6,8")
+    ap.add_argument("--skip-quantize", action="store_true", help="Allocate + validate only")
+    args = ap.parse_args()
+
+    source = Path(args.source).expanduser().resolve()
+    output = Path(args.output).expanduser().resolve()
+    output.mkdir(parents=True, exist_ok=True)
+
+    # --- Step 1: introspect ---
+    print("[1/5] introspecting model …")
+    layer_names, param_counts, groups = introspect_model(source, args.group_spec)
+    group_names = [g.layer_names[0] for g in groups]  # one representative per group
+    print(f"  {len(layer_names)} layers, {len(groups)} groups")
+
+    # --- Step 2: loss table ---
+    loss_table_path = Path(args.loss_table) if args.loss_table else output / "work" / "imatrix_alloc.json"
+    if not loss_table_path.exists():
+        if not args.imatrix or not args.gguf_dir:
+            sys.exit("Need --loss-table or both --imatrix and --gguf-dir")
+        build_loss_table_from_imatrix(
+            imatrix_path=Path(args.imatrix).expanduser(),
+            gguf_dir=Path(args.gguf_dir).expanduser(),
+            layers=[int(x) for x in args.layers.split(",")],
+            which=args.which.split(","),
+            bits_list=[int(x) for x in args.bits.split(",")],
+            group_size=args.group_size,
+            out=loss_table_path,
+        )
+    else:
+        print(f"[2/5] using existing loss table: {loss_table_path}")
+
+    losses, fracs, bitwidths = load_loss_table(loss_table_path)
+
+    # --- Step 3: RCO allocation ---
+    print(f"[3/5] RCO allocation  target={args.target_bpw} bpw …")
+    assignment, report = run_rco_allocation(
+        losses, fracs, bitwidths, args.target_bpw, args.group_size, group_names
+    )
+    print(f"  achieved {report['achieved_bpw']:.4f} bpw")
+    print(f"  histogram: {report['bit_histogram']}")
+
+    # save allocation
+    alloc_path = output / "work" / "allocation.json"
+    alloc_path.parent.mkdir(parents=True, exist_ok=True)
+    alloc_path.write_text(json.dumps(assignment, indent=2, sort_keys=True))
+    print(f"  wrote {alloc_path}")
+
+    # --- Step 4: emit + validate config ---
+    print("[4/5] emitting MLX config + validating …")
+    cfg = emit_and_validate(
+        assignment, args.group_size, source, output, args.default_bits
+    )
+
+    # --- Step 5: quantize ---
+    if args.skip_quantize:
+        print("[5/5] --skip-quantize set, done.")
+        return
+
+    print("[5/5] streaming quantization …")
+    stream_quantize(source, output, assignment, args.group_size)
+
+    print(f"\n{'='*60}")
+    print(f"Pipeline complete. Output: {output}")
+    print(f"Config: {output / 'config.json'}")
+    print(f"{'='*60}")
+
+
+if __name__ == "__main__":
+    main()
