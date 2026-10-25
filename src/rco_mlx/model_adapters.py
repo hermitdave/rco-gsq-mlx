@@ -164,15 +164,12 @@ class LFM2Adapter(ModelAdapter):
         if ltype in ("embedding_norm", "norm", "layernorm"):
             return None
         if ltype == "full_attention":
-            # Attention layers: quantize the projections
             return {"bits": 4, "group_size": self.default_group_size}
         if ltype == "conv":
-            # Conv layers: lighter quantization
             return {"bits": 3, "group_size": self.default_group_size}
         return {"bits": 3, "group_size": self.default_group_size}
 
     def grouping_spec(self) -> Optional[str]:
-        # Group by layer type: all full_attention share one budget, all conv share another
         return (
             "self_attn.q_proj,self_attn.k_proj,self_attn.v_proj,self_attn.out_proj,"
             "self_attn.q_layernorm,self_attn.k_layernorm "
@@ -185,9 +182,6 @@ class LFM2Adapter(ModelAdapter):
         self, source_dir: Path, n_samples: int = 512, seq_len: int = 2048
     ) -> np.ndarray:
         """Load random calibration data (no tokenizer needed for shape)."""
-        # For models without a tokenizer on disk, generate random hidden states
-        # that match the model's input shape. GSQ trains on layer outputs, so
-        # we need (n_samples, seq_len, hidden_dim) activations.
         with open(source_dir / "config.json") as f:
             cfg = json.load(f)
         hidden_dim = cfg.get("hidden_size", 2048)
@@ -208,30 +202,60 @@ class LFM2Adapter(ModelAdapter):
 @register("flint")
 class FlintAdapter(ModelAdapter):
     model_type = "flint"
+    layer_type_key = "layer_types"
     default_group_size = 64
     default_bits = 4
 
-    def enumerate_layers(self, source_dir: Path) -> List[Dict]:
-        import json
-        from safetensors import safe_open
+    # Flint-specific constants from config
+    _NUM_EXPERTS = 256
+    _NUM_EXPERTS_PER_TOK = 6
 
+    # Keys that should always stay BF16
+    _BF16_PREFIXES = (
+        "embed_tokens",
+        "lm_head",
+        "norm",
+        "layernorm",
+        "post_attention_layernorm",
+        "softmax_offset",
+        "q_norm",
+        "k_norm",
+    )
+
+    def enumerate_layers(self, source_dir: Path) -> List[Dict]:
         with open(source_dir / "config.json") as f:
             cfg = json.load(f)
 
         num_layers = cfg.get("num_hidden_layers", 49)
-        full_attention_layers = set(cfg.get("full_attention_layers", []))
+        layer_types = cfg.get("layer_types", [])
+        mlp_only_layers = set(cfg.get("mlp_only_layers", []))
+        no_rope_indices = set(cfg.get("no_rope_layer_indices", []))
 
+        # Read first shard to discover weight keys
         shards = sorted(source_dir.glob("*.safetensors"))
-        param_counts = {}
-        with safe_open(str(shards[0]), framework="pt", device="cpu") as f:
-            for key in f.keys():
-                param_counts[key] = int(f.get_tensor(key).numel())
+        param_counts: Dict[str, int] = {}
+        if shards:
+            with safe_open(str(shards[0]), framework="pt", device="cpu") as f:
+                for key in f.keys():
+                    param_counts[key] = int(f.get_tensor(key).numel())
 
         layers = []
         for idx in range(num_layers):
             prefix = f"model.layers.{idx}."
             weight_keys = [k for k in param_counts if k.startswith(prefix)]
-            ltype = "full_attention" if idx in full_attention_layers else "moe"
+
+            # Determine layer type from config
+            if idx < len(layer_types):
+                ltype = layer_types[idx]
+            elif idx in no_rope_indices:
+                ltype = "full_attention"
+            else:
+                ltype = "sliding_attention"
+
+            # Override: mlp_only_layers are dense (no attention weights)
+            if idx in mlp_only_layers:
+                ltype = "dense_mlp"
+
             layers.append({
                 "index": idx,
                 "type": ltype,
@@ -245,29 +269,76 @@ class FlintAdapter(ModelAdapter):
         idx = layer_descriptor["index"]
         ltype = layer_descriptor["type"]
 
-        if ltype == "full_attention":
-            return {"bits": 6, "group_size": self.default_group_size}
-        # MoE: protect router, quantize experts
-        return {"bits": 3, "group_size": self.default_group_size}
+        # mlp_only_layers: dense MLP, no attention
+        if ltype == "dense_mlp":
+            return {"bits": 4, "group_size": self.default_group_size}
+
+        # Attention components
+        if ltype in ("full_attention", "sliding_attention"):
+            return {"bits": 4, "group_size": self.default_group_size}
+
+        # Fallback
+        return {"bits": 4, "group_size": self.default_group_size}
 
     def grouping_spec(self) -> Optional[str]:
         return (
+            # Attention projections grouped together
             "self_attn.q_proj,self_attn.k_proj,self_attn.v_proj,self_attn.o_proj "
-            "mlp.gate_proj,mlp.up_proj,mlp.down_proj "
-            "mlp.shared_experts.gate_proj,mlp.shared_experts.up_proj,mlp.shared_experts.down_proj"
+            # MoE router (critical, keep high precision)
+            "mlp.gate_proj "
+            # Shared expert
+            "mlp.shared_expert.gate_proj,mlp.shared_expert.up_proj,mlp.shared_expert.down_proj "
+            # MoE routed experts (256 experts, stacked in MLX as one tensor)
+            "mlp.experts"
         )
 
+    def non_quantized_prefixes(self) -> List[str]:
+        return list(self._BF16_PREFIXES) + [
+            "mlp.gate_proj",  # router — keep BF16 / high precision
+        ]
+
     def load_calibration(
-        self, source_dir: Path, n_samples: int = 512, seq_len: int = 2048
+        self,
+        source_dir: Path,
+        n_samples: int = 512,
+        seq_len: int = 2048,
     ) -> np.ndarray:
+        """Load calibration data.
+
+        For GSQ training we need (n_samples, seq_len, hidden_dim) activations.
+        Without a working tokenizer/datasets pipeline, we generate random
+        hidden states matching the model's input shape. This is a stand-in
+        until real calibration data can be collected.
+        """
         with open(source_dir / "config.json") as f:
             cfg = json.load(f)
         hidden_dim = cfg.get("hidden_size", 2048)
         return np.random.randn(n_samples, seq_len, hidden_dim).astype(np.float32)
 
     def map_key_to_mlx(self, key: str) -> Optional[str]:
-        if key.startswith("model.visual."):
+        # Skip non-quantizable prefixes
+        for prefix in self._BF16_PREFIXES:
+            if key.startswith(f"model.{prefix}.") or key == f"model.{prefix}":
+                return None
+
+        # Skip router gate — we keep it BF16 / high precision
+        if ".mlp.gate_proj." in key:
             return None
-        if key.startswith("model.language_model."):
-            return "language_model.model." + key[len("model.language_model."):]
+
+        # Stack MoE experts into a single MLX tensor path
+        # HF: model.layers.{l}.mlp.experts.{e}.{gate,up,down}_proj.weight
+        # MLX: model.layers.{l}.mlp.experts.{gate,up,down}_proj.weight
+        # (experts are stacked along dim 0 in MLX)
+        if ".mlp.experts." in key:
+            # Strip the expert index
+            parts = key.split(".")
+            # model.layers.{l}.mlp.experts.{e}.{proj}.weight
+            new_parts = parts[:4] + parts[5:]  # remove experts.{e}
+            return ".".join(new_parts)
+
+        # Shared expert: rename shared_experts → shared_expert (singular)
+        if ".mlp.shared_experts." in key:
+            return key.replace(".shared_experts.", ".shared_expert.")
+
+        # Everything else maps through unchanged
         return key

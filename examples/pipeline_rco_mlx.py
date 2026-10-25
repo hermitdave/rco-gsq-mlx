@@ -31,6 +31,7 @@ import argparse
 import json
 import sys
 import time
+from collections import Counter
 from pathlib import Path
 
 import numpy as np
@@ -56,8 +57,6 @@ from rco_mlx.search import budget_dp, values_from_losses
 # ---------------------------------------------------------------------------
 def introspect_model(source_dir: Path, group_spec: str | None = None):
     """Return (layer_names, param_counts, groups) from a BF16 safetensors dir."""
-    import safetools  # noqa – we use the raw mmap reader below
-
     from safetensors import safe_open
 
     # discover shards
@@ -212,6 +211,122 @@ def run_rco_allocation(
     return assignment, report
 
 
+def solve_allocation_greedy(
+    losses: np.ndarray,
+    fracs: np.ndarray,
+    bitwidths: np.ndarray,
+    target_bpw: float,
+    group_names: list[str],
+    bitwidth_map: dict[int, float] | None = None,
+) -> tuple[dict[str, int], dict]:
+    """Greedy bitwidth allocation (SLQ-style) with a priority queue.
+
+    Start every group at max bitwidth, then repeatedly take the cheapest
+    one-rung reduction until the parameter-weighted average hits target.
+    Uses a heap so each step is O(log n_groups) instead of O(n_groups).
+    """
+    import heapq
+
+    bitwidth_map = bitwidth_map or {}
+    ordered = sorted(bitwidths.tolist())
+    max_bw = ordered[-1]
+    next_lower = {ordered[i]: ordered[i - 1] for i in range(1, len(ordered))}
+
+    def get_actual(bw: int) -> float:
+        return bitwidth_map.get(bw, float(bw))
+
+    # Build cost lookup: (group_idx, bitwidth) -> loss
+    cost = {}
+    for i in range(losses.shape[0]):
+        for j, bw in enumerate(bitwidths):
+            cost[(i, int(bw))] = float(losses[i, j])
+
+    def avg_bw(cfg: list[int]) -> float:
+        total_w = sum(fracs[i] for i in range(len(cfg)))
+        bits = sum(get_actual(cfg[i]) * fracs[i] for i in range(len(cfg)))
+        return bits / total_w if total_w > 0 else 0.0
+
+    # Initialize at max bitwidth
+    config = [max_bw] * len(group_names)
+
+    # Precompute initial average
+    total_frac = float(fracs.sum())
+    current_bits = float(sum(get_actual(config[i]) * fracs[i] for i in range(len(config))))
+
+    # Build heap: (marginal_cost_per_bit, group_idx, expected_cur, next_bw)
+    heap = []
+    for i in range(len(group_names)):
+        cur = config[i]
+        nxt = next_lower.get(cur)
+        if nxt is None:
+            continue
+        e_cur = cost.get((i, cur), 0.0)
+        e_next = cost.get((i, nxt), 0.0)
+        d_err = e_next - e_cur  # negative (error decreases)
+        d_bits = get_actual(cur) - get_actual(nxt)
+        if d_bits <= 0:
+            continue
+        marginal = d_err / d_bits
+        heapq.heappush(heap, (marginal, i, cur, nxt))
+
+    steps = 0
+    max_steps = len(group_names) * len(ordered)
+
+    while current_bits / total_frac > target_bpw and heap and steps < max_steps:
+        marginal, i, expected_cur, nxt = heapq.heappop(heap)
+        if config[i] != expected_cur:
+            continue  # stale entry
+        old_bw = get_actual(config[i])
+        config[i] = nxt
+        new_bw = get_actual(config[i])
+        current_bits += (new_bw - old_bw) * fracs[i]
+        steps += 1
+        if steps % 5000 == 0:
+            print(f"  greedy step {steps}: avg={current_bits / total_frac:.4f}")
+        # Push next possible drop for this group
+        cur = config[i]
+        nxt2 = next_lower.get(cur)
+        if nxt2 is None:
+            continue
+        e_cur = cost.get((i, cur), 0.0)
+        e_next = cost.get((i, nxt2), 0.0)
+        d_err = e_next - e_cur
+        d_bits = get_actual(cur) - get_actual(nxt2)
+        if d_bits <= 0:
+            continue
+        marginal = d_err / d_bits
+        heapq.heappush(heap, (marginal, i, cur, nxt2))
+
+    achieved = current_bits / total_frac
+    assignment = {group_names[i]: config[i] for i in range(len(group_names))}
+    report = {
+        "achieved_bpw": achieved,
+        "steps": steps,
+        "bit_histogram": dict(
+            sorted(Counter(config).items(), reverse=True)
+        ),
+    }
+    return assignment, report
+
+
+def filter_bf16_prefixes(assignment: dict[str, int], prefixes: list[str]) -> dict[str, int]:
+    """Remove entries whose path contains any of the given prefixes.
+
+    These tensors stay BF16 and should not appear in the quant config.
+    """
+    filtered = {}
+    for path, bits in assignment.items():
+        skip = False
+        for p in prefixes:
+            if p in path:
+                skip = True
+                break
+        if skip:
+            continue
+        filtered[path] = bits
+    return filtered
+
+
 # ---------------------------------------------------------------------------
 # Step 4: emit + validate MLX config
 # ---------------------------------------------------------------------------
@@ -221,6 +336,7 @@ def emit_and_validate(
     source_dir: Path,
     output_dir: Path,
     default_bits: int = 4,
+    validate_on_disk: bool = True,
 ) -> MlxQuantConfig:
     """Write config.json and validate before loading."""
     cfg = allocation_to_config(
@@ -238,16 +354,16 @@ def emit_and_validate(
     out_cfg_path = output_dir / "config.json"
     merged = write_config(cfg, out_cfg_path, base_config=base_cfg)
 
-    # gather on-disk keys from the output dir's index (or source)
-    index_path = output_dir / "model.safetensors.index.json"
-    if not index_path.exists():
-        index_path = source_dir / "model.safetensors.index.json"
     on_disk_keys = []
-    if index_path.exists():
-        idx = json.loads(index_path.read_text())
-        on_disk_keys = list(idx.get("weight_map", {}).keys())
+    if validate_on_disk:
+        index_path = output_dir / "model.safetensors.index.json"
+        if not index_path.exists():
+            index_path = source_dir / "model.safetensors.index.json"
+        if index_path.exists():
+            idx = json.loads(index_path.read_text())
+            on_disk_keys = list(idx.get("weight_map", {}).keys())
 
-    report = validate_allocation(cfg, on_disk_keys=on_disk_keys)
+    report = validate_allocation(cfg, on_disk_keys=on_disk_keys if on_disk_keys else None)
     print(report.summary())
     if not report.ok:
         sys.exit("Validation failed — fix the config before loading.")
@@ -388,6 +504,10 @@ def main():
     ap.add_argument("--layers", default="0,8,16,24,32,40,47", help="Layers to sweep")
     ap.add_argument("--which", default="ffn_down_exps,ffn_gate_exps,attn_qkv")
     ap.add_argument("--bits", default="2,3,4,6,8")
+    ap.add_argument("--method", default="dp", choices=["dp", "greedy"],
+                    help="Allocation method: 'dp' (RCO knapsack, default) or 'greedy' (SLQ-style)")
+    ap.add_argument("--bf16-prefixes", default="",
+                    help="Comma-separated module path prefixes to keep BF16 (skip in quant config)")
     ap.add_argument("--skip-quantize", action="store_true", help="Allocate + validate only")
     args = ap.parse_args()
 
@@ -420,13 +540,24 @@ def main():
 
     losses, fracs, bitwidths = load_loss_table(loss_table_path)
 
-    # --- Step 3: RCO allocation ---
-    print(f"[3/5] RCO allocation  target={args.target_bpw} bpw …")
-    assignment, report = run_rco_allocation(
-        losses, fracs, bitwidths, args.target_bpw, args.group_size, group_names
-    )
+    # --- Step 3: allocation ---
+    print(f"[3/5] allocation  method={args.method} target={args.target_bpw} bpw …")
+    if args.method == "greedy":
+        assignment, report = solve_allocation_greedy(
+            losses, fracs, bitwidths, args.target_bpw, group_names
+        )
+    else:
+        assignment, report = run_rco_allocation(
+            losses, fracs, bitwidths, args.target_bpw, args.group_size, group_names
+        )
     print(f"  achieved {report['achieved_bpw']:.4f} bpw")
     print(f"  histogram: {report['bit_histogram']}")
+
+    # Filter out BF16 tensors from the quant config
+    if args.bf16_prefixes:
+        bf16_prefixes = [p.strip() for p in args.bf16_prefixes.split(",") if p.strip()]
+        assignment = filter_bf16_prefixes(assignment, bf16_prefixes)
+        print(f"  filtered to {len(assignment)} quantized entries ({len(report['bit_histogram'])} unique bitwidths before filter)")
 
     # save allocation
     alloc_path = output / "work" / "allocation.json"
@@ -437,7 +568,8 @@ def main():
     # --- Step 4: emit + validate config ---
     print("[4/5] emitting MLX config + validating …")
     cfg = emit_and_validate(
-        assignment, args.group_size, source, output, args.default_bits
+        assignment, args.group_size, source, output, args.default_bits,
+        validate_on_disk=not args.skip_quantize,
     )
 
     # --- Step 5: quantize ---
