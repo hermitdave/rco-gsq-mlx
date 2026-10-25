@@ -114,6 +114,80 @@ assignment = opt.hard_assignment()
 
 ---
 
+## Using across different models
+
+The pipeline is model-agnostic once you provide a **model adapter** that
+describes the architecture. The adapter tells the pipeline:
+
+- how to enumerate layers and their types
+- which tensors to quantize vs keep BF16
+- how to group layers for RCO allocation
+- how to load calibration data for GSQ training
+- how to map source checkpoint keys to MLX module paths
+
+Two adapters are included:
+
+| Adapter | Model type | Architecture |
+|---|---|---|
+| `LFM2Adapter` | `lfm2` | Conv + full-attention hybrid (LFM2.5) |
+| `FlintAdapter` | `flint` | Hybrid MoE with dense attention layers |
+
+### Adding a new model adapter
+
+Subclass `ModelAdapter` and implement the six methods. The smallest useful
+adapter is ~40 lines — `LFM2Adapter` is the template.
+
+```python
+from rco_mlx import ModelAdapter, register
+
+@register("my_model")
+class MyAdapter(ModelAdapter):
+    model_type = "my_model"
+    default_group_size = 64
+    default_bits = 4
+
+    def enumerate_layers(self, source_dir):
+        # Read config.json + safetensors index
+        # Return [{"index": 0, "type": "dense", "weight_keys": [...], "param_count": N}, ...]
+        ...
+
+    def quant_predicate(self, layer_descriptor):
+        # Return {"bits": 4, "group_size": 64} or None for BF16
+        ...
+
+    def grouping_spec(self):
+        # Return "q_proj,k_proj,v_proj,o_proj mlp.gate_proj,mlp.up_proj,mlp.down_proj"
+        # or None for per-layer groups
+        ...
+
+    def load_calibration(self, source_dir, n_samples=512, seq_len=2048):
+        # Return (n_samples, seq_len, hidden_dim) float32 numpy array
+        ...
+
+    def map_key_to_mlx(self, key):
+        # Map HF key to MLX path, return None to skip
+        ...
+```
+
+Register it with `@register("my_model")` and the pipeline discovers it
+automatically via `rco_mlx.get("my_model")`.
+
+### Running the pipeline on a new model
+
+```bash
+python examples/pipeline_rco_mlx.py \
+    --source /path/to/bf16-model \
+    --output /path/to/output \
+    --target-bpw 4.0 \
+    --group-size 64 \
+    --model-type my_model
+```
+
+The `--model-type` flag selects the adapter. If omitted, the pipeline
+infers it from `config.json`'s `model_type` field.
+
+---
+
 ## MLX integration
 
 The emitted config matches what `mlx_lm.load()` expects:
@@ -167,7 +241,7 @@ the target.
 python -m pytest
 ```
 
-68 tests, pure NumPy, no GPU and no MLX. The manifold primitives are checked
+88 tests, pure NumPy + MLX, no GPU required. The manifold primitives are checked
 against a finite difference of the budget function and the DP against a
 brute-force enumeration, so the port is verified against first principles
 rather than against the PyTorch original.
