@@ -586,7 +586,7 @@ def _stack_experts(output_dir: Path, model_adapter, group_size: int):
 
         # Remove individual expert tensors
         for e in range(num_experts):
-            for suffix in [".weight", ".scales", ".biases"]:
+            for suffix in [".weight", ".weight.scales", ".weight.biases"]:
                 k = f"model.layers.{l}.mlp.experts.{e}.{proj}{suffix}"
                 all_tensors.pop(k, None)
 
