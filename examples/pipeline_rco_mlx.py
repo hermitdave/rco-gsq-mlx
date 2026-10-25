@@ -35,6 +35,7 @@ from collections import Counter
 from pathlib import Path
 
 import numpy as np
+from safetensors import safe_open
 
 # ---------------------------------------------------------------------------
 # rco-mlox imports (installed via `pip install -e ~/Projects/rco-mlx`)
@@ -313,6 +314,7 @@ def filter_bf16_prefixes(assignment: dict[str, int], prefixes: list[str]) -> dic
     """Remove entries whose path contains any of the given prefixes.
 
     These tensors stay BF16 and should not appear in the quant config.
+    Dotted prefixes like ``mlp.gate_proj`` also match ``experts.0.gate_proj``.
     """
     filtered = {}
     for path, bits in assignment.items():
@@ -321,6 +323,12 @@ def filter_bf16_prefixes(assignment: dict[str, int], prefixes: list[str]) -> dic
             if p in path:
                 skip = True
                 break
+            # Dotted prefix: also match by last component
+            if "." in p:
+                last = p.split(".")[-1]
+                if path.endswith("." + last) or ("." + last + ".") in path:
+                    skip = True
+                    break
         if skip:
             continue
         filtered[path] = bits
@@ -378,6 +386,7 @@ def stream_quantize(
     output_dir: Path,
     assignment: dict[str, int],
     group_size: int,
+    model_adapter=None,
 ):
     """Stream through the BF16 source, quantize per the allocation, write shards."""
     import torch
@@ -472,6 +481,14 @@ def stream_quantize(
         elapsed = time.time() - start
         print(f"  saved {len(results)} tensors | {elapsed:.1f}s elapsed")
 
+    # Post-process: stack MoE experts if adapter provides stacking logic
+    if model_adapter is not None:
+        print("\n[quant] post-processing: stacking MoE experts ...")
+        _stack_experts(output_dir, model_adapter, group_size)
+        _rewrite_config_for_stacked_experts(output_dir, assignment)
+        elapsed = time.time() - start
+        print(f"  post-process done | {elapsed:.1f}s elapsed")
+
     # copy non-weight files
     import shutil
 
@@ -483,6 +500,138 @@ def stream_quantize(
             shutil.copy2(f, dest)
 
     print(f"\n[quant] done — {total_tensors} tensors, {time.time()-start:.1f}s total")
+
+
+def _stack_experts(output_dir: Path, model_adapter, group_size: int):
+    """Stack individual expert tensors into switch_mlp projections.
+
+    Reads all quantized shards, groups expert tensors by (layer, projection),
+    stacks their weights/scales/biases along axis 0, and writes the stacked
+    versions. Removes the individual expert tensors.
+    """
+    import torch
+    from safetensors.torch import load_file, save_file
+    import mlx.core as mx
+    import numpy as np
+
+    # Collect all safetensors files
+    shards = sorted(output_dir.glob("*.safetensors"))
+    all_tensors = {}
+    for shard in shards:
+        data = load_file(str(shard), device="cpu")
+        all_tensors.update(data)
+
+    # Find expert tensors to stack
+    expert_patterns = []
+    for key in list(all_tensors.keys()):
+        if ".mlp.experts." in key and key.endswith(".weight"):
+            # Parse: model.layers.{l}.mlp.experts.{e}.{proj}.weight
+            parts = key.split(".")
+            if len(parts) >= 6 and parts[4] == "experts":
+                l = parts[2]
+                e = parts[5]
+                proj = parts[6]
+                expert_patterns.append((l, e, proj, key))
+
+    if not expert_patterns:
+        print("  no expert tensors found to stack")
+        return
+
+    # Group by (layer, projection)
+    from collections import defaultdict
+    groups = defaultdict(list)
+    for l, e, proj, key in expert_patterns:
+        groups[(l, proj)].append((int(e), key))
+
+    stacked_count = 0
+    for (l, proj), experts in sorted(groups.items()):
+        experts.sort(key=lambda x: x[0])
+        num_experts = len(experts)
+
+        # Collect weights, scales, biases for each expert
+        weight_key = f"model.layers.{l}.mlp.experts.0.{proj}.weight"
+        scales_key = f"{weight_key}.scales"
+        biases_key = f"{weight_key}.biases"
+
+        if weight_key not in all_tensors:
+            continue
+
+        w0 = all_tensors[weight_key]
+        s0 = all_tensors.get(scales_key)
+        b0 = all_tensors.get(biases_key)
+
+        # Stack weights along axis 0
+        weights_list = [all_tensors[f"model.layers.{l}.mlp.experts.{e}.{proj}.weight"] for e in range(num_experts)]
+        stacked_w = torch.cat(weights_list, dim=0)
+
+        # Stack scales and biases if present
+        stacked_s = None
+        stacked_b = None
+        if s0 is not None:
+            scales_list = [all_tensors.get(f"model.layers.{l}.mlp.experts.{e}.{proj}.weight.scales") for e in range(num_experts)]
+            if all(s is not None for s in scales_list):
+                stacked_s = torch.cat(scales_list, dim=0)
+        if b0 is not None:
+            biases_list = [all_tensors.get(f"model.layers.{l}.mlp.experts.{e}.{proj}.weight.biases") for e in range(num_experts)]
+            if all(b is not None for b in biases_list):
+                stacked_b = torch.cat(biases_list, dim=0)
+
+        # Write stacked tensors
+        target_weight = f"model.layers.{l}.mlp.switch_mlp.{proj}.weight"
+        all_tensors[target_weight] = stacked_w
+        if stacked_s is not None:
+            all_tensors[f"{target_weight}.scales"] = stacked_s
+        if stacked_b is not None:
+            all_tensors[f"{target_weight}.biases"] = stacked_b
+
+        # Remove individual expert tensors
+        for e in range(num_experts):
+            for suffix in [".weight", ".scales", ".biases"]:
+                k = f"model.layers.{l}.mlp.experts.{e}.{proj}{suffix}"
+                all_tensors.pop(k, None)
+
+        stacked_count += 1
+        print(f"  stacked {num_experts} experts for layer {l} {proj}")
+
+    # Save updated tensors back, replacing the original shards
+    if stacked_count > 0:
+        # Remove original shards
+        for shard in output_dir.glob("model-*-of-*.safetensors"):
+            shard.unlink()
+        # Save consolidated file
+        out_path = output_dir / "model-00001-of-00001.safetensors"
+        save_file(all_tensors, str(out_path))
+        print(f"  saved stacked experts to {out_path.name}")
+
+
+def _rewrite_config_for_stacked_experts(output_dir: Path, assignment: dict[str, int]):
+    """Rewrite config.json to use switch_mlp keys for stacked experts."""
+    import json
+    cfg_path = output_dir / "config.json"
+    if not cfg_path.exists():
+        return
+    with open(cfg_path) as f:
+        cfg = json.load(f)
+    quant = cfg.get("quantization", {})
+    # Remove individual expert entries
+    to_remove = [k for k in quant if ".mlp.experts." in k]
+    for k in to_remove:
+        del quant[k]
+    # Add switch_mlp entries
+    added = 0
+    for path, bits in assignment.items():
+        if ".mlp.experts." not in path:
+            continue
+        parts = path.split(".")
+        l, proj = parts[2], parts[6]
+        switch_key = f"model.layers.{l}.mlp.switch_mlp.{proj}"
+        if switch_key not in quant:
+            quant[switch_key] = {"group_size": 64, "bits": bits, "mode": "affine"}
+            added += 1
+    cfg["quantization"] = quant
+    with open(cfg_path, "w") as f:
+        json.dump(cfg, f, indent=2)
+    print(f"  rewrote config: removed {len(to_remove)} expert entries, added {added} switch_mlp entries")
 
 
 # ---------------------------------------------------------------------------
@@ -508,8 +657,19 @@ def main():
                     help="Allocation method: 'dp' (RCO knapsack, default) or 'greedy' (SLQ-style)")
     ap.add_argument("--bf16-prefixes", default="",
                     help="Comma-separated module path prefixes to keep BF16 (skip in quant config)")
+    ap.add_argument("--model-type", default=None,
+                    help="Model type for adapter-based quantization (e.g. 'flint')")
     ap.add_argument("--skip-quantize", action="store_true", help="Allocate + validate only")
     args = ap.parse_args()
+
+    # Resolve model adapter
+    model_adapter = None
+    if args.model_type:
+        from rco_mlx.model_adapters import get
+        model_adapter = get(args.model_type)
+        if model_adapter is None:
+            sys.exit(f"Unknown model type: {args.model_type}")
+        print(f"Using model adapter: {args.model_type}")
 
     source = Path(args.source).expanduser().resolve()
     output = Path(args.output).expanduser().resolve()
@@ -553,6 +713,28 @@ def main():
     print(f"  achieved {report['achieved_bpw']:.4f} bpw")
     print(f"  histogram: {report['bit_histogram']}")
 
+    # For models with MoE experts, unify bitwidths per (layer, projection)
+    # so that all experts in a group share the same bitwidth — required
+    # for stacking into switch_mlp tensors.
+    if any(".mlp.experts." in p for p in assignment):
+        print("  unifying MoE expert bitwidths per layer-projection ...")
+        from collections import Counter, defaultdict
+        expert_groups = defaultdict(list)
+        for path, bits in assignment.items():
+            if ".mlp.experts." in path:
+                parts = path.split(".")
+                l, proj = parts[2], parts[6]
+                expert_groups[(l, proj)].append(bits)
+        unified = 0
+        for (l, proj), bits_list in expert_groups.items():
+            mode_bits = Counter(bits_list).most_common(1)[0][0]
+            for e in range(256):
+                key = f"model.layers.{l}.mlp.experts.{e}.{proj}"
+                if key in assignment and assignment[key] != mode_bits:
+                    assignment[key] = mode_bits
+                    unified += 1
+        print(f"    unified {unified} expert assignments")
+
     # Filter out BF16 tensors from the quant config
     if args.bf16_prefixes:
         bf16_prefixes = [p.strip() for p in args.bf16_prefixes.split(",") if p.strip()]
@@ -569,7 +751,7 @@ def main():
     print("[4/5] emitting MLX config + validating …")
     cfg = emit_and_validate(
         assignment, args.group_size, source, output, args.default_bits,
-        validate_on_disk=not args.skip_quantize,
+        validate_on_disk=args.skip_quantize,
     )
 
     # --- Step 5: quantize ---
@@ -578,7 +760,7 @@ def main():
         return
 
     print("[5/5] streaming quantization …")
-    stream_quantize(source, output, assignment, args.group_size)
+    stream_quantize(source, output, assignment, args.group_size, model_adapter=model_adapter)
 
     print(f"\n{'='*60}")
     print(f"Pipeline complete. Output: {output}")
