@@ -307,22 +307,34 @@ We validated the pipeline on [allenai/OLMoE-1B-7B-0125](https://huggingface.co/a
 
 **Validation results (4-bit mixed precision, target 4.0 bpw):**
 
-| Metric | BF16 | Quantized | Delta |
-|--------|------|-----------|-------|
-| PPL (fineweb-edu, 50 seqs, 512 tok) | 14.13 | 14.72 | +4.2% |
-| Symmetric KL (128 tok) | — | 0.696 | — |
-| Model size | 25.6 GB | 3.5 GB | 7.3× compression |
+| Method | PPL (wikitext2) | Degradation | 5-bit tensors |
+|--------|-----------------|-------------|---------------|
+| BF16 | 8.890 | — | — |
+| RTN 4-bit (uniform) | 9.412 | +5.8% | 0 |
+| RCO 4-bit (Frobenius error_db) | 9.468 | +6.5% | 36 |
+| RCO 4-bit (Hessian-weighted) | 9.320 | +4.8% | 17 |
 
 **Quantized checkpoint:** [hermitdave/OLMoE-1B-7B-0125-4bit](https://huggingface.co/hermitdave/OLMoE-1B-7B-0125-4bit)
 
 ```bash
+# Hessian-weighted error_db (best quality):
 python examples/pipeline_rco_mlx.py \
     --source /path/to/olmoe-bf16 \
     --output /path/to/output \
     --target-bpw 4.0 \
     --group-size 64 \
     --model-type olmoe \
-    --error-db error_db.json
+    --gptq-errors \
+    --calibration /path/to/calibration.npy
+
+# Uniform RTN baseline:
+python examples/pipeline_rco_mlx.py \
+    --source /path/to/olmoe-bf16 \
+    --output /path/to/output \
+    --target-bpw 4.0 \
+    --group-size 64 \
+    --model-type olmoe \
+    --rtn
 ```
 
 
