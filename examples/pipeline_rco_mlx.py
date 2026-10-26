@@ -739,19 +739,15 @@ def _rewrite_config_for_stacked_experts(output_dir: Path, assignment: dict[str, 
     print(f"  rewrote config: removed {len(to_remove)} expert entries, added {added} switch_mlp entries")
 
 
-def _protect_outliers(assignment: dict[str, int], error_db_path: Path, target_bpw: float, percentile: float = 90.0):
+def _protect_outliers(assignment: dict[str, int], error_db: dict, target_bpw: float, percentile: float = 90.0):
     """Auto-bump layers with error above the given percentile at target bitwidth.
 
-    Reads the error_db, computes the error at target_bpw for each layer,
+    Reads the error_db dict, computes the error at target_bpw for each layer,
     identifies the top ``percentile``% most error-prone layers, and bumps
     them by one rung (if possible). This prevents quality cliffs on
     outlier layers without manual tuning.
     """
-    import json
-    from collections import defaultdict
-
-    db = json.loads(error_db_path.read_text())
-    layers = db.get("layers", {})
+    layers = error_db
 
     # Map layer_path -> error at target_bpw
     errors = {}
@@ -806,6 +802,8 @@ def main():
     ap.add_argument("--skip-quantize", action="store_true", help="Allocate + validate only")
     ap.add_argument("--error-db", default=None,
                     help="SLQ-style error_db.json path (skips imatrix/GGUF entirely)")
+    ap.add_argument("--outlier-percentile", type=float, default=90.0,
+                    help="Percentile threshold for outlier auto-protection (default: 90)")
     args = ap.parse_args()
 
     # Resolve model adapter
@@ -821,6 +819,14 @@ def main():
     source = Path(args.source).expanduser().resolve()
     output = Path(args.output).expanduser().resolve()
     output.mkdir(parents=True, exist_ok=True)
+
+    # Pre-load error_db if provided (used by outlier protection + expert unification)
+    error_db = None
+    if args.error_db:
+        error_db_path = Path(args.error_db).expanduser()
+        if error_db_path.exists():
+            import json as _json
+            error_db = _json.loads(error_db_path.read_text()).get("layers", {})
 
     # --- Step 1: introspect ---
     print("[1/5] introspecting model …")
@@ -881,8 +887,13 @@ def main():
     print(f"  histogram: {report['bit_histogram']}")
 
     # Outlier auto-protection: bump layers with high error at target bitwidth
-    if args.error_db:
-        _protect_outliers(assignment, Path(args.error_db).expanduser(), args.target_bpw)
+    if error_db is not None:
+        _protect_outliers(
+            assignment,
+            error_db,
+            args.target_bpw,
+            percentile=args.outlier_percentile,
+        )
 
     # For models with MoE experts, unify bitwidths per (layer, projection)
     # so that all experts in a group share the same bitwidth — required
@@ -909,13 +920,6 @@ def main():
         # If an error_db is available, use it to pick the bitwidth that
         # minimizes aggregate error across experts. Otherwise fall back
         # to the mode (most common bitwidth).
-        error_db = None
-        if args.error_db:
-            error_db_path = Path(args.error_db).expanduser()
-            if error_db_path.exists():
-                import json as _json
-                error_db = _json.loads(error_db_path.read_text()).get("layers", {})
-
         unified = 0
         for (l, proj), bits_list in expert_groups.items():
             if error_db is not None:
@@ -984,6 +988,44 @@ def main():
     print(f"\n{'='*60}")
     print(f"Pipeline complete. Output: {output}")
     print(f"Config: {output / 'config.json'}")
+    print(f"{'='*60}")
+
+    # Summary report
+    _print_summary(assignment, output, group_size, args.target_bpw, error_db if args.error_db else None)
+
+
+def _print_summary(assignment, output, group_size, target_bpw, error_db):
+    """Print a final summary of the quantization."""
+    from collections import Counter
+
+    bit_hist = Counter(assignment.values())
+    total_params = 0
+    for path, bits in assignment.items():
+        # Estimate params from layer name (rough)
+        total_params += 1
+
+    print(f"\n{'='*60}")
+    print("QUANTIZATION SUMMARY")
+    print(f"{'='*60}")
+    print(f"Target: {target_bpw:.2f} bpw")
+    print(f"Group size: {group_size}")
+    print(f"Quantized tensors: {len(assignment)}")
+    print(f"Bitwidth distribution:")
+    for bw in sorted(bit_hist.keys(), reverse=True):
+        print(f"  {int(bw)}-bit: {bit_hist[bw]} tensors")
+
+    if error_db is not None:
+        # Compute aggregate error at assigned bitwidths
+        total_err = 0.0
+        count = 0
+        for path, bits in assignment.items():
+            bw_data = error_db.get(path, {}).get(str(int(bits)))
+            if bw_data is not None:
+                total_err += bw_data.get("error", 0.0)
+                count += 1
+        if count > 0:
+            print(f"Mean relative error: {total_err / count:.6f}")
+
     print(f"{'='*60}")
 
 
