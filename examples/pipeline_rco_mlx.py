@@ -912,6 +912,10 @@ def main():
             })
         loss_table_path.write_text(json.dumps(rows, indent=2))
         print(f"  {len(rows)} groups, bitwidths={bitwidths_list}")
+        # Pre-load error_db for outlier protection + expert unification
+        if error_db is None:
+            import json as _json
+            error_db = _json.loads(hessian_db_path.read_text()).get("layers", {})
 
     elif not loss_table_path.exists():
         if not args.imatrix or not args.gguf_dir:
