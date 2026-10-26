@@ -316,9 +316,10 @@ class FlintAdapter(ModelAdapter):
         return np.random.randn(n_samples, seq_len, hidden_dim).astype(np.float32)
 
     def map_key_to_mlx(self, key: str) -> Optional[str]:
-        # Skip non-quantizable prefixes
+        # Skip BF16 prefixes — handle both top-level (model.embed_tokens)
+        # and nested (model.layers.0.mlp.gate) by matching path components
         for prefix in self._BF16_PREFIXES:
-            if key.startswith(f"model.{prefix}.") or key == f"model.{prefix}":
+            if f".{prefix}." in f".{key}." or key.startswith(f"{prefix}.") or key == prefix:
                 return None
 
         # Skip router gate — we keep it BF16 / high precision
@@ -341,4 +342,107 @@ class FlintAdapter(ModelAdapter):
             return key.replace(".shared_experts.", ".shared_expert.")
 
         # Everything else maps through unchanged
+        return key
+
+
+# ---------------------------------------------------------------------------
+# OLMoE adapter (AllenAI, 1B active / 7B total)
+# ---------------------------------------------------------------------------
+
+@register("olmoe")
+class OLMoEAdapter(ModelAdapter):
+    """Adapter for OLMoE-1B-7B (model_type: olmoe).
+
+    Architecture: 16 identical MoE layers, 64 routed experts, top-8 routing.
+    No shared expert, no sliding window, no MTP.
+    Router is ``mlp.gate`` (not SwiGLU's ``gate_proj``).
+    """
+
+    model_type = "olmoe"
+    default_group_size = 64
+    default_bits = 4
+
+    # Keys that must stay BF16 regardless of RCO assignment
+    _BF16_PREFIXES = (
+        "embed_tokens",
+        "lm_head",
+        "norm",           # model.norm (final RMSNorm)
+        "layernorm",      # input_layernorm, post_attention_layernorm
+        "q_norm",         # per-head Q RMSNorm
+        "k_norm",         # per-head K RMSNorm
+        "mlp.gate",       # router logits — extremely sensitive, must stay BF16
+    )
+
+    def enumerate_layers(self, source_dir: Path) -> List[Dict]:
+        with open(source_dir / "config.json") as f:
+            cfg = json.load(f)
+
+        num_layers = cfg.get("num_hidden_layers", 16)
+        num_experts = cfg.get("num_experts", 64)
+
+        # Read first shard for weight keys + shapes
+        shards = sorted(source_dir.glob("*.safetensors"))
+        param_counts: Dict[str, int] = {}
+        if shards:
+            with safe_open(str(shards[0]), framework="pt", device="cpu") as f:
+                for key in f.keys():
+                    param_counts[key] = int(f.get_tensor(key).numel())
+
+        layers = []
+        for idx in range(num_layers):
+            prefix = f"model.layers.{idx}."
+            weight_keys = [k for k in param_counts if k.startswith(prefix)]
+            layers.append({
+                "index": idx,
+                "type": "moe",
+                "weight_keys": weight_keys,
+                "param_count": sum(param_counts[k] for k in weight_keys),
+            })
+
+        return layers
+
+    def quant_predicate(self, layer_descriptor: Dict) -> Optional[Dict]:
+        # All MoE layers: quantize attention + experts, keep norms/router BF16
+        return {
+            "bits": self.default_bits,
+            "group_size": self.default_group_size,
+        }
+
+    def grouping_spec(self) -> Optional[str]:
+        return (
+            # Attention projections share a group
+            "self_attn.q_proj,self_attn.k_proj,self_attn.v_proj,self_attn.o_proj"
+            # All experts for a given projection share a group
+            " model.layers.N.mlp.experts.N.up_proj"
+            " model.layers.N.mlp.experts.N.down_proj"
+            " model.layers.N.mlp.experts.N.gate_proj"
+        )
+
+    def non_quantized_prefixes(self) -> List[str]:
+        return list(self._BF16_PREFIXES)
+
+    def load_calibration(
+        self,
+        source_dir: Path,
+        n_samples: int = 512,
+        seq_len: int = 2048,
+    ) -> np.ndarray:
+        with open(source_dir / "config.json") as f:
+            cfg = json.load(f)
+        hidden_dim = cfg.get("hidden_size", 2048)
+        return np.random.randn(n_samples, seq_len, hidden_dim).astype(np.float32)
+
+    def map_key_to_mlx(self, key: str) -> Optional[str]:
+        # Skip BF16 prefixes
+        for prefix in self._BF16_PREFIXES:
+            if key.startswith(f"model.{prefix}.") or key == f"model.{prefix}":
+                return None
+
+        # Experts: keep the experts.N path so the pipeline's _stack_experts
+        # post-processing can stack them into switch_mlp tensors.
+        # MLX-LM's olmoe loader also accepts both formats.
+        if ".mlp.experts." in key:
+            return key
+
+        # Everything else (attention projs) maps through unchanged
         return key

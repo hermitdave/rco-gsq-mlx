@@ -187,6 +187,47 @@ def load_loss_table(path: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     return losses, fracs, bitwidths
 
 
+def load_error_db(path: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Load a SLQ-style error_db.json and return (losses, fracs, bitwidths).
+
+    The error_db format is::
+
+        {
+          "layers": {
+            "model.layers.0.self_attn.q_proj": {
+              "2": {"error": 0.123},
+              "3": {"error": 0.456}
+            }
+          },
+          "param_counts": {"model.layers.0.self_attn.q_proj": 123456}
+        }
+
+    Returns the same tuple as ``load_loss_table`` so callers are agnostic.
+    """
+    db = json.loads(path.read_text())
+    if "layers" not in db:
+        sys.exit(f"Not a valid error_db.json (no 'layers' key): {path}")
+
+    bitwidths = sorted({int(b) for layer_data in db["layers"].values() for b in layer_data})
+    param_counts = db.get("param_counts", {})
+
+    rows = []
+    for layer_path, bw_data in db["layers"].items():
+        params = param_counts.get(layer_path, 0)
+        mse = {str(bw): bw_data[str(bw)]["error"] for bw in bitwidths if str(bw) in bw_data}
+        rows.append({"layer": layer_path, "tensor": layer_path, "params": params, "mse": mse})
+
+    bitwidths_arr = np.array(bitwidths, dtype=np.int64)
+    losses = np.array(
+        [[r["mse"][str(b)] for b in bitwidths] for r in rows],
+        dtype=np.float64,
+    )
+    params = np.array([r["params"] for r in rows], dtype=np.float64)
+    fracs = params / max(params.sum(), 1.0)
+
+    return losses, fracs, bitwidths_arr
+
+
 # ---------------------------------------------------------------------------
 # Step 3: RCO allocation
 # ---------------------------------------------------------------------------
@@ -338,6 +379,23 @@ def filter_bf16_prefixes(assignment: dict[str, int], prefixes: list[str]) -> dic
 # ---------------------------------------------------------------------------
 # Step 4: emit + validate MLX config
 # ---------------------------------------------------------------------------
+def _is_quantizable(path: str) -> bool:
+    """Return True if the path points to a quantizable linear layer.
+
+    Works with both the raw checkpoint keys (with ``.weight``) and the
+    stripped module paths used in the RCO assignment dict.
+    """
+    check = path if path.endswith(".weight") else path + ".weight"
+    if "norm" in check or "embed" in check or "lm_head" in check or "mtp" in check:
+        return False
+    # Skip gate_proj (kept BF16 for SwiGLU gating or router logits)
+    if check.endswith(".gate_proj.weight"):
+        return False
+    if not check.endswith(".weight"):
+        return False
+    return True
+
+
 def emit_and_validate(
     assignment: dict[str, int],
     group_size: int,
@@ -345,10 +403,18 @@ def emit_and_validate(
     output_dir: Path,
     default_bits: int = 4,
     validate_on_disk: bool = True,
+    bf16_prefixes: list[str] | None = None,
 ) -> MlxQuantConfig:
     """Write config.json and validate before loading."""
+    # Filter out BF16 prefixes so they never enter the quant config
+    filtered = assignment
+    if bf16_prefixes:
+        filtered = filter_bf16_prefixes(assignment, bf16_prefixes)
+
+    # Only include quantizable layers in the config
+    quant_assignment = {k: v for k, v in filtered.items() if _is_quantizable(k)}
     cfg = allocation_to_config(
-        assignment,
+        quant_assignment,
         default_bits=default_bits,
         group_size=group_size,
         mode="affine",
@@ -416,16 +482,24 @@ def stream_quantize(
         return key
 
     def should_quantize(mlx_key: str) -> tuple[bool, int]:
+        # Always-skip patterns
         if (
             "norm" in mlx_key
             or "embed" in mlx_key
             or "lm_head" in mlx_key
             or "mtp" in mlx_key
-            or "gate_proj" in mlx_key
             or not mlx_key.endswith(".weight")
             or mlx_key.endswith(".bias")
         ):
+            print(f"  SKIP quant: {mlx_key}")
             return False, 4
+
+        # Adapter-specific BF16 prefixes (e.g. router gate)
+        if model_adapter is not None:
+            for prefix in model_adapter.non_quantized_prefixes():
+                if f".{prefix}." in f".{mlx_key}." or mlx_key.startswith(f"{prefix}.") or mlx_key == prefix:
+                    print(f"  SKIP bf16 prefix: {mlx_key}")
+                    return False, 4
 
         # check the assignment
         bits = layer_bits_with_suffix.get(mlx_key)
@@ -461,13 +535,14 @@ def stream_quantize(
                             w, bits=bits, group_size=group_size
                         )
                         mx.eval(q, scales, biases)
+                        base_key = mlx_key[:-len(".weight")] if mlx_key.endswith(".weight") else mlx_key
                         results[mlx_key] = torch.from_numpy(
                             np.array(q).astype(np.uint32)
                         )
-                        results[f"{mlx_key}.scales"] = torch.from_numpy(
+                        results[f"{base_key}.scales"] = torch.from_numpy(
                             np.array(scales).astype(np.float16)
                         )
-                        results[f"{mlx_key}.biases"] = torch.from_numpy(
+                        results[f"{base_key}.biases"] = torch.from_numpy(
                             np.array(biases).astype(np.float16)
                         )
                     else:
@@ -537,6 +612,20 @@ def _stack_experts(output_dir: Path, model_adapter, group_size: int):
         print("  no expert tensors found to stack")
         return
 
+    print(f"  DEBUG: found {len(expert_patterns)} expert weight patterns")
+    # Show first few keys and whether scales/biases exist
+    for l, e, proj, key in expert_patterns[:3]:
+        skey = f"model.layers.{l}.mlp.experts.{e}.{proj}.scales"
+        bkey = f"model.layers.{l}.mlp.experts.{e}.{proj}.biases"
+        print(f"  DEBUG: weight={key}, scales={skey in all_tensors}, biases={bkey in all_tensors}")
+
+    # DEBUG: check if scales/biases exist
+    sample_weights = [k for k in all_tensors if k.endswith('.weight') and '.mlp.experts.' in k][:3]
+    for wkey in sample_weights:
+        skey = f"{wkey[:-len('.weight')]}.scales"
+        bkey = f"{wkey[:-len('.weight')]}.biases"
+        print(f"  DEBUG: {wkey}: scales={skey in all_tensors}, biases={bkey in all_tensors}")
+
     # Group by (layer, projection)
     from collections import defaultdict
     groups = defaultdict(list)
@@ -554,11 +643,13 @@ def _stack_experts(output_dir: Path, model_adapter, group_size: int):
         biases_key = f"{weight_key}.biases"
 
         if weight_key not in all_tensors:
+            print(f"  DEBUG: {l} {proj}: weight_key missing")
             continue
 
         w0 = all_tensors[weight_key]
         s0 = all_tensors.get(scales_key)
         b0 = all_tensors.get(biases_key)
+        print(f"  DEBUG: {l} {proj}: weight={w0.shape} scales={s0 is not None} biases={b0 is not None}")
 
         # Stack weights along axis 0
         weights_list = [all_tensors[f"model.layers.{l}.mlp.experts.{e}.{proj}.weight"] for e in range(num_experts)]
@@ -568,25 +659,29 @@ def _stack_experts(output_dir: Path, model_adapter, group_size: int):
         stacked_s = None
         stacked_b = None
         if s0 is not None:
-            scales_list = [all_tensors.get(f"model.layers.{l}.mlp.experts.{e}.{proj}.weight.scales") for e in range(num_experts)]
+            scales_list = [all_tensors.get(f"model.layers.{l}.mlp.experts.{e}.{proj}.scales") for e in range(num_experts)]
             if all(s is not None for s in scales_list):
                 stacked_s = torch.cat(scales_list, dim=0)
         if b0 is not None:
-            biases_list = [all_tensors.get(f"model.layers.{l}.mlp.experts.{e}.{proj}.weight.biases") for e in range(num_experts)]
+            biases_list = [all_tensors.get(f"model.layers.{l}.mlp.experts.{e}.{proj}.biases") for e in range(num_experts)]
             if all(b is not None for b in biases_list):
                 stacked_b = torch.cat(biases_list, dim=0)
 
         # Write stacked tensors
         target_weight = f"model.layers.{l}.mlp.switch_mlp.{proj}.weight"
         all_tensors[target_weight] = stacked_w
+        target_base = target_weight[:-len(".weight")]
+        print(f"  DEBUG: {l} {proj}: stacked_s={stacked_s is not None}, stacked_b={stacked_b is not None}")
         if stacked_s is not None:
-            all_tensors[f"{target_weight}.scales"] = stacked_s
+            all_tensors[f"{target_base}.scales"] = stacked_s
+            print(f"  DEBUG: wrote {target_base}.scales")
         if stacked_b is not None:
-            all_tensors[f"{target_weight}.biases"] = stacked_b
+            all_tensors[f"{target_base}.biases"] = stacked_b
+            print(f"  DEBUG: wrote {target_base}.biases")
 
         # Remove individual expert tensors
         for e in range(num_experts):
-            for suffix in [".weight", ".weight.scales", ".weight.biases"]:
+            for suffix in [".weight", ".scales", ".biases"]:
                 k = f"model.layers.{l}.mlp.experts.{e}.{proj}{suffix}"
                 all_tensors.pop(k, None)
 
@@ -595,7 +690,7 @@ def _stack_experts(output_dir: Path, model_adapter, group_size: int):
 
     # Save updated tensors back, replacing the original shards
     if stacked_count > 0:
-        # Remove original shards
+        # Remove the original per-expert shards to avoid duplicates
         for shard in output_dir.glob("model-*-of-*.safetensors"):
             shard.unlink()
         # Save consolidated file
@@ -660,15 +755,18 @@ def main():
     ap.add_argument("--model-type", default=None,
                     help="Model type for adapter-based quantization (e.g. 'flint')")
     ap.add_argument("--skip-quantize", action="store_true", help="Allocate + validate only")
+    ap.add_argument("--error-db", default=None,
+                    help="SLQ-style error_db.json path (skips imatrix/GGUF entirely)")
     args = ap.parse_args()
 
     # Resolve model adapter
     model_adapter = None
     if args.model_type:
         from rco_mlx.model_adapters import get
-        model_adapter = get(args.model_type)
-        if model_adapter is None:
+        adapter_cls = get(args.model_type)
+        if adapter_cls is None:
             sys.exit(f"Unknown model type: {args.model_type}")
+        model_adapter = adapter_cls()
         print(f"Using model adapter: {args.model_type}")
 
     source = Path(args.source).expanduser().resolve()
@@ -683,9 +781,29 @@ def main():
 
     # --- Step 2: loss table ---
     loss_table_path = Path(args.loss_table) if args.loss_table else output / "work" / "imatrix_alloc.json"
-    if not loss_table_path.exists():
+
+    if args.error_db:
+        error_db_path = Path(args.error_db).expanduser()
+        if not error_db_path.exists():
+            sys.exit(f"error_db not found: {error_db_path}")
+        print(f"[2/5] loading SLQ error_db: {error_db_path}")
+        losses, fracs, bitwidths = load_error_db(error_db_path)
+        # Also save as the canonical loss table for downstream steps
+        loss_table_path.parent.mkdir(parents=True, exist_ok=True)
+        bitwidths_list = bitwidths.tolist()
+        rows = []
+        for i in range(len(fracs)):
+            rows.append({
+                "layer": f"group_{i}",
+                "tensor": f"group_{i}",
+                "params": int(fracs[i] * 1e6),
+                "mse": {str(b): float(losses[i, j]) for j, b in enumerate(bitwidths_list)},
+            })
+        loss_table_path.write_text(json.dumps(rows, indent=2))
+        print(f"  {len(rows)} groups, bitwidths={bitwidths_list}")
+    elif not loss_table_path.exists():
         if not args.imatrix or not args.gguf_dir:
-            sys.exit("Need --loss-table or both --imatrix and --gguf-dir")
+            sys.exit("Need --loss-table, --error-db, or both --imatrix and --gguf-dir")
         build_loss_table_from_imatrix(
             imatrix_path=Path(args.imatrix).expanduser(),
             gguf_dir=Path(args.gguf_dir).expanduser(),
@@ -695,10 +813,10 @@ def main():
             group_size=args.group_size,
             out=loss_table_path,
         )
+        losses, fracs, bitwidths = load_loss_table(loss_table_path)
     else:
         print(f"[2/5] using existing loss table: {loss_table_path}")
-
-    losses, fracs, bitwidths = load_loss_table(loss_table_path)
+        losses, fracs, bitwidths = load_loss_table(loss_table_path)
 
     # --- Step 3: allocation ---
     print(f"[3/5] allocation  method={args.method} target={args.target_bpw} bpw …")
@@ -725,15 +843,24 @@ def main():
                 parts = path.split(".")
                 l, proj = parts[2], parts[6]
                 expert_groups[(l, proj)].append(bits)
+        # Infer the number of experts per layer from the assignment keys
+        experts_per_layer: Dict[str, int] = {}
+        for path in assignment:
+            if ".mlp.experts." in path:
+                parts = path.split(".")
+                l, e, proj = parts[2], int(parts[5]), parts[6]
+                key = f"{l}.{proj}"
+                experts_per_layer[key] = max(experts_per_layer.get(key, 0), e + 1)
         unified = 0
         for (l, proj), bits_list in expert_groups.items():
             mode_bits = Counter(bits_list).most_common(1)[0][0]
-            for e in range(256):
+            n_experts = experts_per_layer.get(f"{l}.{proj}", 0)
+            for e in range(n_experts):
                 key = f"model.layers.{l}.mlp.experts.{e}.{proj}"
                 if key in assignment and assignment[key] != mode_bits:
                     assignment[key] = mode_bits
                     unified += 1
-        print(f"    unified {unified} expert assignments")
+        print(f"    unified {unified} expert assignments across {len(expert_groups)} groups")
 
     # Filter out BF16 tensors from the quant config
     if args.bf16_prefixes:
@@ -749,9 +876,13 @@ def main():
 
     # --- Step 4: emit + validate config ---
     print("[4/5] emitting MLX config + validating …")
+    bf16_prefixes = None
+    if model_adapter is not None:
+        bf16_prefixes = model_adapter.non_quantized_prefixes()
     cfg = emit_and_validate(
         assignment, args.group_size, source, output, args.default_bits,
         validate_on_disk=args.skip_quantize,
+        bf16_prefixes=bf16_prefixes,
     )
 
     # --- Step 5: quantize ---

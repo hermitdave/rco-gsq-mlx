@@ -29,6 +29,7 @@ you commit to a 15-minute checkpoint load.
 | `mlx_alloc.py` | — | New. Emits the MLX config block. |
 | `validate.py` | — | New. Structural checks before a load. |
 | `gsq_format.py` | — | New. GSQ/Humming → MLX affine conversion. |
+| `scripts/build_error_db.py` | — | New. Builds a SLQ-style `error_db.json` from BF16 safetensors. |
 
 **The one design change that matters.** The original drives the optimizer from
 a live PyTorch model: it registers a parametrization on every layer's weight,
@@ -185,6 +186,32 @@ python examples/pipeline_rco_mlx.py \
 
 The `--model-type` flag selects the adapter. If omitted, the pipeline
 infers it from `config.json`'s `model_type` field.
+
+### Using a SLQ-style error database
+
+Instead of a dummy or imatrix-based loss table, you can drive allocation from
+a real measured error database:
+
+```bash
+python src/rco_mlx/scripts/build_error_db.py \
+    --source /path/to/bf16-model \
+    --output error_db.json \
+    --model-type olmoe \
+    --bitwidths 2,3,4,6,8 \
+    --group-size 64
+
+python examples/pipeline_rco_mlx.py \
+    --source /path/to/bf16-model \
+    --output /path/to/output \
+    --target-bpw 4.0 \
+    --group-size 64 \
+    --model-type olmoe \
+    --error-db error_db.json
+```
+
+The `--error-db` flag skips the imatrix/GGUF dependency entirely. The pipeline
+loads the database, converts it to the same internal format as the legacy loss
+table, and runs the same RCO allocation.
 
 ---
 
