@@ -639,11 +639,11 @@ def _stack_experts(output_dir: Path, model_adapter, group_size: int):
 
         # Collect weights, scales, biases for each expert
         weight_key = f"model.layers.{l}.mlp.experts.0.{proj}.weight"
-        scales_key = f"{weight_key}.scales"
-        biases_key = f"{weight_key}.biases"
+        base_key = weight_key[:-len(".weight")]
+        scales_key = f"{base_key}.scales"
+        biases_key = f"{base_key}.biases"
 
         if weight_key not in all_tensors:
-            print(f"  DEBUG: {l} {proj}: weight_key missing")
             continue
 
         w0 = all_tensors[weight_key]
@@ -667,15 +667,25 @@ def _stack_experts(output_dir: Path, model_adapter, group_size: int):
             if all(b is not None for b in biases_list):
                 stacked_b = torch.cat(biases_list, dim=0)
 
+        # Reshape from 2D concatenated to 3D (num_experts, rows, cols)
+        # MLX-LM expects 3D expert tensors, matching mx.stack() output in sanitize()
+        num_experts = len(weights_list)
+        w_rows, w_cols = stacked_w.shape
+        stacked_w = stacked_w.view(num_experts, w_rows // num_experts, w_cols)
+
         # Write stacked tensors
         target_weight = f"model.layers.{l}.mlp.switch_mlp.{proj}.weight"
         all_tensors[target_weight] = stacked_w
         target_base = target_weight[:-len(".weight")]
         print(f"  DEBUG: {l} {proj}: stacked_s={stacked_s is not None}, stacked_b={stacked_b is not None}")
         if stacked_s is not None:
+            s_rows, s_cols = stacked_s.shape
+            stacked_s = stacked_s.view(num_experts, s_rows // num_experts, s_cols)
             all_tensors[f"{target_base}.scales"] = stacked_s
             print(f"  DEBUG: wrote {target_base}.scales")
         if stacked_b is not None:
+            b_rows, b_cols = stacked_b.shape
+            stacked_b = stacked_b.view(num_experts, b_rows // num_experts, b_cols)
             all_tensors[f"{target_base}.biases"] = stacked_b
             print(f"  DEBUG: wrote {target_base}.biases")
 

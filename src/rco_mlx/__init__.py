@@ -31,19 +31,6 @@ from .grouping import (
     get_layer_to_group_mapping,
     parse_group_spec,
 )
-from .gsq_format import (
-    PACKS_PER_WORD,
-    dequantize_exact_width,
-    gsq_to_mlx_affine,
-    quantize_to_mlx_affine,
-)
-from .gsq_quantizer import (
-    CosineLRScheduler,
-    GumbelQuantizer2Bit,
-    GumbelQuantizerInt,
-    Lion,
-    effective_bits as gsq_effective_bits,
-)
 from .manifold import (
     budget_normal,
     project_gradient,
@@ -100,16 +87,6 @@ __all__ = [
     "write_config",
     "read_config",
     "recover_bits_from_packed_shape",
-    # gsq
-    "GumbelQuantizer2Bit",
-    "GumbelQuantizerInt",
-    "Lion",
-    "CosineLRScheduler",
-    "gsq_effective_bits",
-    "PACKS_PER_WORD",
-    "dequantize_exact_width",
-    "gsq_to_mlx_affine",
-    "quantize_to_mlx_affine",
     # adapters
     "ModelAdapter",
     "FlintAdapter",

@@ -26,10 +26,9 @@ you commit to a 15-minute checkpoint load.
 | `search.ProjectedGumbelOptimizer` | `optimize_projected_gumbel` | Faithful algorithm, different interface (see below). |
 | `grouping.py` | `src/grouping.py` | Transcription; the original has no torch dependency either. |
 | `objective.py` | — | New. Shapes a measured loss table for the DP. |
-| `mlx_alloc.py` | — | New. Emits the MLX config block. |
-| `validate.py` | — | New. Structural checks before a load. |
-| `gsq_format.py` | — | New. GSQ/Humming → MLX affine conversion. |
-| `scripts/build_error_db.py` | — | New. Builds a SLQ-style `error_db.json` from BF16 safetensors. |
+|| `mlx_alloc.py` | — | New. Emits the MLX config block. |
+|| `validate.py` | — | New. Structural checks before a load. |
+|| `scripts/build_error_db.py` | — | New. Builds a SLQ-style `error_db.json` from BF16 safetensors. |
 
 **The one design change that matters.** The original drives the optimizer from
 a live PyTorch model: it registers a parametrization on every layer's weight,
@@ -67,7 +66,7 @@ pip install -e .
 ```
 
 NumPy only. MLX is an optional extra (`pip install -e ".[mlx]"`) and is only
-needed for `gsq_format.quantize_to_mlx_affine`.
+needed for quantization utilities.
 
 ---
 
@@ -120,11 +119,11 @@ assignment = opt.hard_assignment()
 The pipeline is model-agnostic once you provide a **model adapter** that
 describes the architecture. The adapter tells the pipeline:
 
-- how to enumerate layers and their types
-- which tensors to quantize vs keep BF16
-- how to group layers for RCO allocation
-- how to load calibration data for GSQ training
-- how to map source checkpoint keys to MLX module paths
+|- how to enumerate layers and their types
+|- which tensors to quantize vs keep BF16
+|- how to group layers for RCO allocation
+|- how to load calibration data for error measurement
+|- how to map source checkpoint keys to MLX module paths
 
 Two adapters are included:
 
@@ -279,16 +278,12 @@ rather than against the PyTorch original.
 
 - **No benchmarks yet.** This port has not been run against a quantized model,
   so there are no quality numbers here. The comparison that motivated it —
-  GSQ+RCO versus EXL3 — is a cross-paper inference, not a head-to-head.
+  RCO versus EXL3 — is a cross-paper inference, not a head-to-head.
 - **The table path is a proxy.** It assumes separability. The optimizer path
   does not, but needs a differentiable backend to be useful.
-- **The GSQ converter is a re-quantization.** GSQ's levels are learned; MLX's
-  are a uniform affine grid. The packing coincides (16 two-bit values per
-  uint32, LSB-first, both) but the codebook does not, so
-  `gsq_to_mlx_affine` dequantizes and re-quantizes rather than transcoding.
-  For 2-bit the grids are both 4-level so the error is small, but it is not
-  zero. To use GSQ's grid exactly, use the Humming kernels
-  (`pip install humming-kernels`) rather than MLX.
+- **The MLX affine format is the target.** MLX's levels are a uniform affine
+  grid. The packing coincides (16 two-bit values per uint32, LSB-first)
+  but the codebook is standard, so there is no transcoding step.
 - **EXL3 is not ported and is not a good first target.** Its format has no MLX
   kernel: no trellis decode, no procedural codebook, no double-sided Hadamard,
   no fused MMA. Its encode path (Hessian + LDLQ + Viterbi) is CUDA-only. And
@@ -298,13 +293,42 @@ rather than against the PyTorch original.
 
 ## Attribution
 
+---
+
+## OLMoE-1B-7B-0125 validation
+
+We validated the pipeline on [allenai/OLMoE-1B-7B-0125](https://huggingface.co/allenai/OLMoE-1B-7B-0125), a 1B-parameter mixture-of-experts model with 64 experts per layer and top-8 routing.
+
+**What changed:**
+- Added `OLMoEAdapter` in `model_adapters.py` for native MLX-LM support
+- Expert stacking now reshapes to 3D `(num_experts, rows, cols)` matching MLX-LM's `sanitize()` format
+- Router (`mlp.gate`) preserved in BF16
+- Pipeline post-processes quantized checkpoints to consolidate per-expert tensors into `switch_mlp` projections
+
+**Validation results (4-bit mixed precision, target 4.0 bpw):**
+
+| Metric | BF16 | Quantized | Delta |
+|--------|------|-----------|-------|
+| PPL (fineweb-edu, 50 seqs, 512 tok) | 14.13 | 14.72 | +4.2% |
+| Symmetric KL (128 tok) | — | 0.696 | — |
+| Model size | 25.6 GB | 3.5 GB | 7.3× compression |
+
+**Quantized checkpoint:** [hermitdave/OLMoE-1B-7B-0125-4bit](https://huggingface.co/hermitdave/OLMoE-1B-7B-0125-4bit)
+
+```bash
+python examples/pipeline_rco_mlx.py \
+    --source /path/to/olmoe-bf16 \
+    --output /path/to/output \
+    --target-bpw 4.0 \
+    --group-size 64 \
+    --model-type olmoe \
+    --error-db error_db.json
+```
+
+
 RCO is © ISTA-DASLab (Michael Helcig, Dan Alistarh), Apache-2.0. The
 optimizer, manifold primitives, and grouping logic here are a port of
 [ISTA-DASLab/RCO](https://github.com/IST-DASLab/RCO) and remain Apache-2.0.
-
-GSQ is © ISTA-DASLab (Dadgarnia, Tabesh, Nikdan, Helcig, Kurtić, Kleinegger,
-Alistarh), Apache-2.0. The packing decoder in `gsq_format.py` follows the
-published Humming layout.
 
 Port and MLX integration by **Hermit Dave**, produced with **Hermes Agent**
 (Nous Research).

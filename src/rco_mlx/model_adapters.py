@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Model adapter for the GSQ + RCO quantization pipeline.
+Model adapter for the RCO quantization pipeline.
 
 Each supported model gets a small adapter class that describes:
   - how to enumerate its layers and tensors
@@ -89,7 +89,7 @@ class ModelAdapter(ABC):
         n_samples: int = 512,
         seq_len: int = 2048,
     ) -> np.ndarray:
-        """Load calibration activations for GSQ training.
+        """Load calibration activations for error measurement.
 
         Returns (n_samples, hidden_dim) float32 numpy array.
         """
@@ -305,7 +305,7 @@ class FlintAdapter(ModelAdapter):
     ) -> np.ndarray:
         """Load calibration data.
 
-        For GSQ training we need (n_samples, seq_len, hidden_dim) activations.
+        For error measurement we need (n_samples, seq_len, hidden_dim) activations.
         Without a working tokenizer/datasets pipeline, we generate random
         hidden states matching the model's input shape. This is a stand-in
         until real calibration data can be collected.
