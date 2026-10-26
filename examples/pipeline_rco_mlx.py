@@ -739,9 +739,48 @@ def _rewrite_config_for_stacked_experts(output_dir: Path, assignment: dict[str, 
     print(f"  rewrote config: removed {len(to_remove)} expert entries, added {added} switch_mlp entries")
 
 
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
+def _protect_outliers(assignment: dict[str, int], error_db_path: Path, target_bpw: float, percentile: float = 90.0):
+    """Auto-bump layers with error above the given percentile at target bitwidth.
+
+    Reads the error_db, computes the error at target_bpw for each layer,
+    identifies the top ``percentile``% most error-prone layers, and bumps
+    them by one rung (if possible). This prevents quality cliffs on
+    outlier layers without manual tuning.
+    """
+    import json
+    from collections import defaultdict
+
+    db = json.loads(error_db_path.read_text())
+    layers = db.get("layers", {})
+
+    # Map layer_path -> error at target_bpw
+    errors = {}
+    for path, bw_data in layers.items():
+        bw_key = str(int(target_bpw))
+        if bw_key in bw_data:
+            errors[path] = bw_data[bw_key].get("error", 0.0)
+
+    if len(errors) < 10:
+        print("  [outliers] too few layers to detect outliers")
+        return
+
+    # Compute percentile threshold
+    err_values = np.array(list(errors.values()))
+    threshold = float(np.percentile(err_values, percentile))
+
+    # Find outliers and bump them
+    bumped = 0
+    for path, err in errors.items():
+        if err > threshold:
+            cur = assignment.get(path)
+            if cur is not None and cur < 8:
+                assignment[path] = cur + 1
+                bumped += 1
+
+    if bumped > 0:
+        print(f"  [outliers] protected {bumped} layers above {percentile:.0f}th percentile (threshold={threshold:.6f})")
+
+
 def main():
     ap = argparse.ArgumentParser(
         description="RCO mixed-precision quantization pipeline for MLX",
@@ -841,12 +880,17 @@ def main():
     print(f"  achieved {report['achieved_bpw']:.4f} bpw")
     print(f"  histogram: {report['bit_histogram']}")
 
+    # Outlier auto-protection: bump layers with high error at target bitwidth
+    if args.error_db:
+        _protect_outliers(assignment, Path(args.error_db).expanduser(), args.target_bpw)
+
     # For models with MoE experts, unify bitwidths per (layer, projection)
     # so that all experts in a group share the same bitwidth — required
     # for stacking into switch_mlp tensors.
     if any(".mlp.experts." in p for p in assignment):
         print("  unifying MoE expert bitwidths per layer-projection ...")
         from collections import Counter, defaultdict
+
         expert_groups = defaultdict(list)
         for path, bits in assignment.items():
             if ".mlp.experts." in path:
@@ -861,9 +905,43 @@ def main():
                 l, e, proj = parts[2], int(parts[5]), parts[6]
                 key = f"{l}.{proj}"
                 experts_per_layer[key] = max(experts_per_layer.get(key, 0), e + 1)
+
+        # If an error_db is available, use it to pick the bitwidth that
+        # minimizes aggregate error across experts. Otherwise fall back
+        # to the mode (most common bitwidth).
+        error_db = None
+        if args.error_db:
+            error_db_path = Path(args.error_db).expanduser()
+            if error_db_path.exists():
+                import json as _json
+                error_db = _json.loads(error_db_path.read_text()).get("layers", {})
+
         unified = 0
         for (l, proj), bits_list in expert_groups.items():
-            mode_bits = Counter(bits_list).most_common(1)[0][0]
+            if error_db is not None:
+                # Pick bitwidth minimizing aggregate error across experts
+                best_bw = None
+                best_err = float("inf")
+                for candidate_bw in sorted(set(bits_list)):
+                    total_err = 0.0
+                    count = 0
+                    for e in range(experts_per_layer.get(f"{l}.{proj}", 0)):
+                        expert_key = f"model.layers.{l}.mlp.experts.{e}.{proj}"
+                        layer_data = error_db.get(expert_key, {})
+                        bw_data = layer_data.get(str(candidate_bw))
+                        if bw_data is not None:
+                            total_err += bw_data.get("error", 0.0)
+                            count += 1
+                    if count > 0 and total_err < best_err:
+                        best_err = total_err
+                        best_bw = candidate_bw
+                if best_bw is not None:
+                    mode_bits = best_bw
+                else:
+                    mode_bits = Counter(bits_list).most_common(1)[0][0]
+            else:
+                mode_bits = Counter(bits_list).most_common(1)[0][0]
+
             n_experts = experts_per_layer.get(f"{l}.{proj}", 0)
             for e in range(n_experts):
                 key = f"model.layers.{l}.mlp.experts.{e}.{proj}"

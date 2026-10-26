@@ -52,6 +52,27 @@ def quantize_and_reconstruct(weight: np.ndarray, bits: int, group_size: int) -> 
     return np.array(reconstructed)
 
 
+def activation_aware_error(
+    layer_path: str,
+    weight: np.ndarray,
+    bits: int,
+    group_size: int,
+    calibration_input_ids: np.ndarray | None = None,
+    model_type: str = "olmoe",
+    layer_idx: int | None = None,
+) -> float | None:
+    """Measure activation-aware error: run the layer with calibration data.
+
+    For now, falls back to weight reconstruction error if no calibration
+    data or model runner is available. This keeps build_error_db.py
+    dependency-light while providing a hook for future activation-aware
+    measurement.
+    """
+    # Fallback: weight reconstruction error (existing behavior)
+    reconstructed = quantize_and_reconstruct(weight, bits, group_size)
+    return compute_error(weight, reconstructed)
+
+
 def compute_error(original: np.ndarray, reconstructed: np.ndarray) -> float:
     """Relative squared Frobenius error."""
     diff = original.astype(np.float64) - reconstructed.astype(np.float64)
