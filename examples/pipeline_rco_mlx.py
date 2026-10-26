@@ -785,9 +785,9 @@ def main():
     ap.add_argument("--error-db", default=None,
                     help="SLQ-style error_db.json path (skips imatrix/GGUF entirely)")
     ap.add_argument("--gptq-errors", action="store_true",
-                    help="Use GPTQ-style Hessian-weighted error measurement (requires --calibration)")
+                    help="Build error_db with Hessian-weighted error measurement (requires --calibration)")
     ap.add_argument("--calibration", default=None,
-                    help="Path to calibration token IDs .npy file for GPTQ error measurement")
+                    help="Path to calibration token IDs .npy file for Hessian-weighted error measurement")
     ap.add_argument("--outlier-percentile", type=float, default=90.0,
                     help="Percentile threshold for outlier auto-protection (default: 90)")
     args = ap.parse_args()
@@ -845,23 +845,23 @@ def main():
         print(f"  {len(rows)} groups, bitwidths={bitwidths_list}")
 
     elif args.gptq_errors:
-        # Build error_db using GPTQ-style Hessian-weighted error measurement
+        # Build error_db using Hessian-weighted error measurement
         if not args.calibration:
             sys.exit("--gptq-errors requires --calibration (path to .npy token IDs)")
         calib_path = Path(args.calibration)
         if not calib_path.exists():
             sys.exit(f"Calibration file not found: {calib_path}")
-        print(f"[2/5] building GPTQ-style error_db with calibration: {calib_path}")
-        gptq_db_path = output / "work" / "error_db_gptq.json"
-        gptq_db_path.parent.mkdir(parents=True, exist_ok=True)
+        print(f"[2/5] building Hessian-weighted error_db with calibration: {calib_path}")
+        hessian_db_path = output / "work" / "error_db_hessian.json"
+        hessian_db_path.parent.mkdir(parents=True, exist_ok=True)
         import subprocess
         script = (
-            Path(__file__).parent.parent / "src" / "rco_mlx" / "scripts" / "build_error_db_gptq.py"
+            Path(__file__).parent.parent / "src" / "rco_mlx" / "scripts" / "build_error_db.py"
         )
         cmd = [
             sys.executable, str(script),
             "--source", str(source),
-            "--output", str(gptq_db_path),
+            "--output", str(hessian_db_path),
             "--model-type", args.model_type or "default",
             "--calibration", str(calib_path),
             "--bitwidths", args.bits,
@@ -869,10 +869,10 @@ def main():
         ]
         result = subprocess.run(cmd, capture_output=True, text=True)
         if result.returncode != 0:
-            sys.exit(f"GPTQ error_db build failed:\n{result.stderr}")
+            sys.exit(f"Hessian error_db build failed:\n{result.stderr}")
         print(result.stdout)
-        # Use the GPTQ error_db as the error source
-        error_db_path = gptq_db_path
+        # Use the Hessian error_db as the error source
+        error_db_path = hessian_db_path
         losses, fracs, bitwidths = load_error_db(error_db_path)
         loss_table_path.parent.mkdir(parents=True, exist_ok=True)
         bitwidths_list = bitwidths.tolist()

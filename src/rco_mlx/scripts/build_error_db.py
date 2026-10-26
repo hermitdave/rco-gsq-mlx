@@ -2,19 +2,35 @@
 """Build a SLQ-style error_db.json from a BF16 safetensors checkpoint.
 
 For each quantizable linear layer, quantize at each bitwidth in {2,3,4,6,8}
-using MLX affine, then measure relative squared Frobenius error:
+using MLX affine, then measure quantization error.
 
-    error = ||W - Q(W)||² / ||W||²
+Two error modes are available:
 
-The result is an error_db.json compatible with rco-mlx's pipeline.
+1. **Plain Frobenius** (default, no calibration needed):
+       error = ||W - Q(W)||² / ||W||²
+
+2. **Hessian-weighted** (requires ``--calibration``):
+       error = (W - Q(W))^T H_diag (W - Q(W)) / (W^T H_diag W)
+
+   The Hessian diagonal is the empirical Fisher estimated from calibration
+   activations: ``H_diag[l] = mean(x², axis=0)`` where ``x`` is the input
+   to the linear layer. This requires loading the BF16 model and running
+   calibration data through it, adding ~30–60 seconds of overhead but
+   giving better per-layer sensitivity estimates.
 
 Usage:
+    # Plain Frobenius (fast, no model load):
     python -m rco_mlx.scripts.build_error_db \\
         --source ~/Projects/rco-mlx/.cache/olmoe-1b-7b-0125 \\
-        --output ~/Projects/rco-mlx/.cache/olmoe-test-output/error_db.json \\
+        --output error_db.json \\
+        --model-type olmoe
+
+    # Hessian-weighted (requires calibration data):
+    python -m rco_mlx.scripts.build_error_db \\
+        --source ~/Projects/rco-mlx/.cache/olmoe-1b-7b-0125 \\
+        --output error_db.json \\
         --model-type olmoe \\
-        --bitwidths 2,3,4,6,8 \\
-        --group-size 64
+        --calibration /tmp/olmoe_calib_input_ids.npy
 
 Port and MLX integration by **Hermit Dave**, produced with **Hermes Agent**
 (Nous Research).
@@ -25,23 +41,110 @@ import sys
 from pathlib import Path
 
 import mlx.core as mx
+import mlx.nn as nn
 import numpy as np
 from safetensors import safe_open
 
-
-def get_adapter(model_type: str):
-    from rco_mlx.model_adapters import get
-    return get(model_type)()
+from rco_mlx.model_adapters import get
 
 
-def is_quantizable(adapter, layer_path: str) -> bool:
-    """Check if a layer path should be quantized."""
-    for prefix in adapter.non_quantized_prefixes():
-        if f".{prefix}." in f".{layer_path}." or layer_path.startswith(f"{prefix}.") or layer_path == prefix:
-            return False
-    return True
+# ---------------------------------------------------------------------------
+# Activation-capturing linear layer (for Hessian mode)
+# ---------------------------------------------------------------------------
+class _CaptureLinear(nn.Linear):
+    """Drop-in replacement for nn.Linear that stores the last input."""
+
+    def __call__(self, x):
+        self._last_input = x
+        return super().__call__(x)
 
 
+def _set_module_by_path(model, path: str, new_module):
+    """Replace a module by dot-separated path, handling list indices."""
+    parts = [p for p in path.split(".") if p]
+    obj = model
+    for part in parts[:-1]:
+        obj = obj[int(part)] if part.isdigit() else getattr(obj, part)
+    last = parts[-1]
+    if last.isdigit():
+        obj[int(last)] = new_module
+    else:
+        setattr(obj, last, new_module)
+
+
+def _get_module(model, path: str):
+    parts = [p for p in path.split(".") if p]
+    obj = model
+    for part in parts:
+        obj = obj[int(part)] if part.isdigit() else getattr(obj, part)
+    return obj
+
+
+def wrap_linear_layers(model):
+    """Wrap every nn.Linear to capture activations. Returns wrapped paths."""
+    wrapped = []
+    for name, _ in model.named_modules():
+        if not name:
+            continue
+        parts = [p for p in name.split(".") if p]
+        obj = model
+        for part in parts:
+            obj = obj[int(part)] if part.isdigit() else getattr(obj, part)
+        if isinstance(obj, nn.Linear) and not isinstance(obj, _CaptureLinear):
+            wrapper = _CaptureLinear(
+                input_dims=obj.weight.shape[1],
+                output_dims=obj.weight.shape[0],
+                bias="bias" in obj,
+            )
+            wrapper.weight = obj.weight
+            if "bias" in obj:
+                wrapper.bias = obj.bias
+            _set_module_by_path(model, name, wrapper)
+            wrapped.append(name)
+    return wrapped
+
+
+def _collect_activations(model, wrapped_paths, calibration_ids, batch_size=4):
+    """Run calibration data and compute per-layer Hessian diagonals.
+
+    Returns:
+        dict: layer_path -> hessian_diag (1-D numpy array, shape: in_features)
+    """
+    n_samples = calibration_ids.shape[0]
+    accum = {p: None for p in wrapped_paths}
+    total_tokens = 0
+
+    for i in range(0, n_samples, batch_size):
+        batch = calibration_ids[i : i + batch_size]
+        input_ids = mx.array(batch)
+        mx.eval(input_ids)
+        logits = model(input_ids)
+        mx.eval(logits)
+
+        for path in wrapped_paths:
+            module = _get_module(model, path)
+            x = module._last_input
+            if x is None:
+                continue
+            x_np = np.array(x)
+            # Sum of squares over all axes except last (in_features)
+            ss = np.sum(x_np ** 2, axis=tuple(range(x_np.ndim - 1)))
+            if accum[path] is None:
+                accum[path] = ss
+            else:
+                accum[path] += ss
+            total_tokens += x_np.shape[0] * (x_np.shape[1] if x_np.ndim > 1 else 1)
+
+    hessian = {}
+    for path, ss in accum.items():
+        if ss is not None:
+            hessian[path] = ss / total_tokens
+    return hessian
+
+
+# ---------------------------------------------------------------------------
+# Quantization + error
+# ---------------------------------------------------------------------------
 def quantize_and_reconstruct(weight: np.ndarray, bits: int, group_size: int) -> np.ndarray:
     """Quantize with MLX affine and dequantize back to float32."""
     w = mx.array(weight, dtype=mx.float32)
@@ -52,42 +155,61 @@ def quantize_and_reconstruct(weight: np.ndarray, bits: int, group_size: int) -> 
     return np.array(reconstructed)
 
 
-def activation_aware_error(
-    layer_path: str,
-    weight: np.ndarray,
-    bits: int,
-    group_size: int,
-    calibration_input_ids: np.ndarray | None = None,
-    model_type: str = "olmoe",
-    layer_idx: int | None = None,
-) -> float | None:
-    """Measure activation-aware error: run the layer with calibration data.
-
-    For now, falls back to weight reconstruction error if no calibration
-    data or model runner is available. This keeps build_error_db.py
-    dependency-light while providing a hook for future activation-aware
-    measurement.
-    """
-    # Fallback: weight reconstruction error (existing behavior)
-    reconstructed = quantize_and_reconstruct(weight, bits, group_size)
-    return compute_error(weight, reconstructed)
-
-
 def compute_error(original: np.ndarray, reconstructed: np.ndarray) -> float:
     """Relative squared Frobenius error."""
     diff = original.astype(np.float64) - reconstructed.astype(np.float64)
     norm_diff = np.sum(diff * diff)
-    norm_orig = np.sum(original.astype(np.float64) * original.astype(np.float64))
+    norm_orig = np.sum(original.astype(np.float64) ** 2)
     return float(norm_diff / max(norm_orig, 1e-12))
 
 
+def compute_hessian_weighted_error(original: np.ndarray, reconstructed: np.ndarray, h_diag: np.ndarray | None) -> float:
+    """Compute Hessian-weighted relative error.
+
+    If h_diag is provided:
+        error = sum((W - Q(W))^2 * H) / sum(W^2 * H)
+    Otherwise falls back to plain Frobenius.
+    """
+    diff = original.astype(np.float64) - reconstructed.astype(np.float64)
+    if h_diag is not None:
+        if diff.ndim == 2:
+            h = h_diag.reshape(1, -1)
+        else:
+            h = h_diag
+        weighted_diff = np.sum(diff ** 2 * h)
+        weighted_orig = np.sum(original.astype(np.float64) ** 2 * h)
+        return float(weighted_diff / max(weighted_orig, 1e-12))
+    else:
+        return compute_error(original, reconstructed)
+
+
+# ---------------------------------------------------------------------------
+# Adapter helpers
+# ---------------------------------------------------------------------------
+def get_adapter(model_type: str):
+    return get(model_type)()
+
+
+def is_quantizable(adapter, layer_path: str) -> bool:
+    for prefix in adapter.non_quantized_prefixes():
+        if f".{prefix}." in f".{layer_path}." or layer_path.startswith(f"{prefix}.") or layer_path == prefix:
+            return False
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 def main():
     ap = argparse.ArgumentParser(description="Build SLQ-style error_db.json from BF16 checkpoint")
     ap.add_argument("--source", required=True, help="BF16 safetensors directory")
     ap.add_argument("--output", required=True, help="Output error_db.json path")
     ap.add_argument("--model-type", required=True, help="Model type for adapter")
+    ap.add_argument("--calibration", default=None, help="Calibration token IDs .npy (enables Hessian-weighted error)")
     ap.add_argument("--bitwidths", default="2,3,4,6,8", help="Bitwidths to sweep")
     ap.add_argument("--group-size", type=int, default=64, help="Quantization group size")
+    ap.add_argument("--batch-size", type=int, default=4, help="Calibration batch size (Hessian mode)")
+    ap.add_argument("--hessian-batch-size", type=int, default=4, help="Alias for --batch-size")
     args = ap.parse_args()
 
     source = Path(args.source)
@@ -103,10 +225,8 @@ def main():
         print(f"No safetensors in {source}")
         sys.exit(1)
 
-    # Build filename -> Path lookup
     shard_map = {s.name: s for s in shards}
 
-    # Read weight keys from index or first shard
     index_path = source / "model.safetensors.index.json"
     if index_path.exists():
         with open(index_path) as f:
@@ -117,7 +237,6 @@ def main():
             all_keys = sorted(f.keys())
         weight_map = {k: shards[0].name for k in all_keys}
 
-    # Filter to quantizable .weight keys
     quant_keys = []
     for k in all_keys:
         if not k.endswith(".weight"):
@@ -127,6 +246,30 @@ def main():
             quant_keys.append((base, weight_map[k]))
 
     print(f"Quantizable tensors: {len(quant_keys)}")
+
+    # Optional: load model and collect Hessian diagonals
+    hessian_map = None
+    use_hessian = False
+    if args.calibration:
+        calib_path = Path(args.calibration)
+        if not calib_path.exists():
+            sys.exit(f"Calibration file not found: {calib_path}")
+        calibration_ids = np.load(str(calib_path))
+        print(f"Calibration data: {calibration_ids.shape}")
+
+        print("Loading BF16 model for activation capture...")
+        from mlx_lm.utils import load as mlx_load
+        model, _ = mlx_load(str(source))
+        model.eval()
+
+        print("Wrapping linear layers...")
+        wrapped_paths = wrap_linear_layers(model)
+        print(f"  Wrapped {len(wrapped_paths)} layers")
+
+        print(f"Running calibration (batch_size={args.batch_size})...")
+        hessian_map = _collect_activations(model, wrapped_paths, calibration_ids, batch_size=args.batch_size)
+        print(f"  Collected Hessian for {len(hessian_map)} layers")
+        use_hessian = True
 
     # Build error database
     db = {"layers": {}, "param_counts": {}}
@@ -149,11 +292,13 @@ def main():
         param_count = int(tensor.size)
         db["param_counts"][base] = param_count
 
+        h_diag = hessian_map.get(base) if hessian_map is not None else None
+
         layer_errors = {}
         for bw in bitwidths:
             try:
                 reconstructed = quantize_and_reconstruct(tensor, bw, args.group_size)
-                err = compute_error(tensor, reconstructed)
+                err = compute_hessian_weighted_error(tensor, reconstructed, h_diag)
                 layer_errors[str(bw)] = {"error": err}
                 all_errors.append(err)
             except Exception as e:
@@ -164,12 +309,14 @@ def main():
             db["layers"][base] = layer_errors
 
         if (idx + 1) % 100 == 0 or (idx + 1) == total:
-            print(f"  [{idx+1}/{total}] {base} — "
-                  f"errors: " + ", ".join(f"{bw}={layer_errors[str(bw)]['error']:.6f}" 
+            mode = "Hessian" if use_hessian else "Frobenius"
+            print(f"  [{idx+1}/{total}] {base} [{mode}] — "
+                  f"errors: " + ", ".join(f"{bw}={layer_errors[str(bw)]['error']:.6f}"
                                           for bw in bitwidths if str(bw) in layer_errors))
 
     output.write_text(json.dumps(db, indent=2))
-    print(f"\nWrote error_db.json: {len(db['layers'])} layers, {len(all_errors)} measurements")
+    mode = "Hessian-weighted" if use_hessian else "Frobenius"
+    print(f"\nWrote error_db.json ({mode}): {len(db['layers'])} layers, {len(all_errors)} measurements")
     if all_errors:
         print(f"Error range: [{min(all_errors):.6f}, {max(all_errors):.6f}], mean={np.mean(all_errors):.6f}")
 
