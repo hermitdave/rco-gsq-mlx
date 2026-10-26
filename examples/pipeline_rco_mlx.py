@@ -612,20 +612,6 @@ def _stack_experts(output_dir: Path, model_adapter, group_size: int):
         print("  no expert tensors found to stack")
         return
 
-    print(f"  DEBUG: found {len(expert_patterns)} expert weight patterns")
-    # Show first few keys and whether scales/biases exist
-    for l, e, proj, key in expert_patterns[:3]:
-        skey = f"model.layers.{l}.mlp.experts.{e}.{proj}.scales"
-        bkey = f"model.layers.{l}.mlp.experts.{e}.{proj}.biases"
-        print(f"  DEBUG: weight={key}, scales={skey in all_tensors}, biases={bkey in all_tensors}")
-
-    # DEBUG: check if scales/biases exist
-    sample_weights = [k for k in all_tensors if k.endswith('.weight') and '.mlp.experts.' in k][:3]
-    for wkey in sample_weights:
-        skey = f"{wkey[:-len('.weight')]}.scales"
-        bkey = f"{wkey[:-len('.weight')]}.biases"
-        print(f"  DEBUG: {wkey}: scales={skey in all_tensors}, biases={bkey in all_tensors}")
-
     # Group by (layer, projection)
     from collections import defaultdict
     groups = defaultdict(list)
@@ -649,7 +635,6 @@ def _stack_experts(output_dir: Path, model_adapter, group_size: int):
         w0 = all_tensors[weight_key]
         s0 = all_tensors.get(scales_key)
         b0 = all_tensors.get(biases_key)
-        print(f"  DEBUG: {l} {proj}: weight={w0.shape} scales={s0 is not None} biases={b0 is not None}")
 
         # Stack weights along axis 0
         weights_list = [all_tensors[f"model.layers.{l}.mlp.experts.{e}.{proj}.weight"] for e in range(num_experts)]
@@ -677,17 +662,14 @@ def _stack_experts(output_dir: Path, model_adapter, group_size: int):
         target_weight = f"model.layers.{l}.mlp.switch_mlp.{proj}.weight"
         all_tensors[target_weight] = stacked_w
         target_base = target_weight[:-len(".weight")]
-        print(f"  DEBUG: {l} {proj}: stacked_s={stacked_s is not None}, stacked_b={stacked_b is not None}")
         if stacked_s is not None:
             s_rows, s_cols = stacked_s.shape
             stacked_s = stacked_s.view(num_experts, s_rows // num_experts, s_cols)
             all_tensors[f"{target_base}.scales"] = stacked_s
-            print(f"  DEBUG: wrote {target_base}.scales")
         if stacked_b is not None:
             b_rows, b_cols = stacked_b.shape
             stacked_b = stacked_b.view(num_experts, b_rows // num_experts, b_cols)
             all_tensors[f"{target_base}.biases"] = stacked_b
-            print(f"  DEBUG: wrote {target_base}.biases")
 
         # Remove individual expert tensors
         for e in range(num_experts):
@@ -991,7 +973,7 @@ def main():
     print(f"{'='*60}")
 
     # Summary report
-    _print_summary(assignment, output, group_size, args.target_bpw, error_db if args.error_db else None)
+    _print_summary(assignment, output, args.group_size, args.target_bpw, error_db if args.error_db else None)
 
 
 def _print_summary(assignment, output, group_size, target_bpw, error_db):
