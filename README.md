@@ -307,14 +307,21 @@ We validated the pipeline on [allenai/OLMoE-1B-7B-0125](https://huggingface.co/a
 
 **Validation results (4-bit mixed precision, target 4.0 bpw):**
 
-| Method | PPL (wikitext2) | Degradation | 5-bit tensors |
-|--------|-----------------|-------------|---------------|
-| BF16 | 8.890 | — | — |
-| RTN 4-bit (uniform) | 9.412 | +5.8% | 0 |
-| RCO 4-bit (Frobenius error_db) | 9.468 | +6.5% | 36 |
-| RCO 4-bit (Hessian-weighted) | 9.320 | +4.8% | 17 |
+| Method | PPL (wikitext2) | Degradation | 5-bit tensors | Size |
+|--------|-----------------|-------------|---------------|------|
+| BF16 | 8.890 | — | — | 25.6 GB |
+| **RTN 4-bit (uniform)** | **9.412** | **+5.8%** | 0 | **3.9 GB** |
+| RCO 4-bit (Frobenius error_db) | 9.468 | +6.5% | 36 | 3.5 GB |
+| **RCO 4-bit (Hessian-weighted)** | **9.320** | **+4.8%** | 17 | **3.5 GB** |
 
-**Quantized checkpoint:** [hermitdave/OLMoE-1B-7B-0125-4bit](https://huggingface.co/hermitdave/OLMoE-1B-7B-0125-4bit)
+**Checkpoints:**
+- **RCO Hessian-weighted** (best): [hermitdave/OLMoE-1B-7B-0125-4bit](https://huggingface.co/hermitdave/OLMoE-1B-7B-0125-4bit)
+- **RTN baseline**: [hermitdave/OLMoE-1B-7B-0125-4bit-rtn](https://huggingface.co/hermitdave/OLMoE-1B-7B-0125-4bit-rtn)
+
+**KV cache quantization (KVD):**
+- Both checkpoints achieve 100% token agreement at 4-bit KV cache
+- Peak inference memory: ~6.9 GB for both (MLX dequantizes to full precision at runtime)
+- Savings are in storage/I/O, not RAM
 
 ```bash
 # Hessian-weighted error_db (best quality):
