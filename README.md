@@ -311,7 +311,6 @@ We validated the pipeline on [allenai/OLMoE-1B-7B-0125](https://huggingface.co/a
 |--------|-----------------|-------------|---------------|------|
 | BF16 | 8.890 | — | — | 25.6 GB |
 | **RTN 4-bit (uniform)** | **9.412** | **+5.8%** | 0 | **3.9 GB** |
-| RCO 4-bit (Frobenius error_db) | 9.468 | +6.5% | 36 | 3.5 GB |
 | **RCO 4-bit (Hessian-weighted)** | **9.320** | **+4.8%** | 17 | **3.5 GB** |
 
 **Checkpoints:**
@@ -331,7 +330,6 @@ python examples/pipeline_rco_mlx.py \
     --target-bpw 4.0 \
     --group-size 64 \
     --model-type olmoe \
-    --gptq-errors \
     --calibration /path/to/calibration.npy
 
 # Uniform RTN baseline:

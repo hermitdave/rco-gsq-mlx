@@ -1,31 +1,21 @@
 #!/usr/bin/env python3
-"""Build a SLQ-style error_db.json from a BF16 safetensors checkpoint.
+"""Build a Hessian-weighted error_db.json from a BF16 safetensors checkpoint.
 
 For each quantizable linear layer, quantize at each bitwidth in {2,3,4,6,8}
-using MLX affine, then measure quantization error.
+using MLX affine, then measure quantization error weighted by the empirical
+Fisher diagonal estimated from calibration activations:
 
-Two error modes are available:
+    error = (W - Q(W))^T H_diag (W - Q(W)) / (W^T H_diag W)
 
-1. **Plain Frobenius** (default, no calibration needed):
-       error = ||W - Q(W)||² / ||W||²
+The Hessian diagonal ``H_diag`` is estimated by running calibration data through
+the model and capturing per-layer inputs via ``_CaptureLinear`` wrappers:
 
-2. **Hessian-weighted** (requires ``--calibration``):
-       error = (W - Q(W))^T H_diag (W - Q(W)) / (W^T H_diag W)
+    H_diag[l] = mean(x^2, axis=all-but-last)
 
-   The Hessian diagonal is the empirical Fisher estimated from calibration
-   activations: ``H_diag[l] = mean(x², axis=0)`` where ``x`` is the input
-   to the linear layer. This requires loading the BF16 model and running
-   calibration data through it, adding ~30–60 seconds of overhead but
-   giving better per-layer sensitivity estimates.
+This gives better per-layer sensitivity estimates than plain Frobenius error,
+leading to better mixed-precision allocation decisions.
 
 Usage:
-    # Plain Frobenius (fast, no model load):
-    python -m rco_mlx.scripts.build_error_db \\
-        --source ~/Projects/rco-mlx/.cache/olmoe-1b-7b-0125 \\
-        --output error_db.json \\
-        --model-type olmoe
-
-    # Hessian-weighted (requires calibration data):
     python -m rco_mlx.scripts.build_error_db \\
         --source ~/Projects/rco-mlx/.cache/olmoe-1b-7b-0125 \\
         --output error_db.json \\
@@ -155,32 +145,19 @@ def quantize_and_reconstruct(weight: np.ndarray, bits: int, group_size: int) -> 
     return np.array(reconstructed)
 
 
-def compute_error(original: np.ndarray, reconstructed: np.ndarray) -> float:
-    """Relative squared Frobenius error."""
-    diff = original.astype(np.float64) - reconstructed.astype(np.float64)
-    norm_diff = np.sum(diff * diff)
-    norm_orig = np.sum(original.astype(np.float64) ** 2)
-    return float(norm_diff / max(norm_orig, 1e-12))
-
-
-def compute_hessian_weighted_error(original: np.ndarray, reconstructed: np.ndarray, h_diag: np.ndarray | None) -> float:
+def compute_hessian_weighted_error(original: np.ndarray, reconstructed: np.ndarray, h_diag: np.ndarray) -> float:
     """Compute Hessian-weighted relative error.
 
-    If h_diag is provided:
-        error = sum((W - Q(W))^2 * H) / sum(W^2 * H)
-    Otherwise falls back to plain Frobenius.
+    error = sum((W - Q(W))^2 * H) / sum(W^2 * H)
     """
     diff = original.astype(np.float64) - reconstructed.astype(np.float64)
-    if h_diag is not None:
-        if diff.ndim == 2:
-            h = h_diag.reshape(1, -1)
-        else:
-            h = h_diag
-        weighted_diff = np.sum(diff ** 2 * h)
-        weighted_orig = np.sum(original.astype(np.float64) ** 2 * h)
-        return float(weighted_diff / max(weighted_orig, 1e-12))
+    if diff.ndim == 2:
+        h = h_diag.reshape(1, -1)
     else:
-        return compute_error(original, reconstructed)
+        h = h_diag
+    weighted_diff = np.sum(diff ** 2 * h)
+    weighted_orig = np.sum(original.astype(np.float64) ** 2 * h)
+    return float(weighted_diff / max(weighted_orig, 1e-12))
 
 
 # ---------------------------------------------------------------------------
@@ -205,11 +182,11 @@ def main():
     ap.add_argument("--source", required=True, help="BF16 safetensors directory")
     ap.add_argument("--output", required=True, help="Output error_db.json path")
     ap.add_argument("--model-type", required=True, help="Model type for adapter")
-    ap.add_argument("--calibration", default=None, help="Calibration token IDs .npy (enables Hessian-weighted error)")
+    ap.add_argument("--calibration", required=True,
+                    help="Path to calibration token IDs .npy file (required for Hessian-weighted error)")
     ap.add_argument("--bitwidths", default="2,3,4,6,8", help="Bitwidths to sweep")
     ap.add_argument("--group-size", type=int, default=64, help="Quantization group size")
-    ap.add_argument("--batch-size", type=int, default=4, help="Calibration batch size (Hessian mode)")
-    ap.add_argument("--hessian-batch-size", type=int, default=4, help="Alias for --batch-size")
+    ap.add_argument("--batch-size", type=int, default=4, help="Calibration batch size")
     args = ap.parse_args()
 
     source = Path(args.source)
@@ -247,29 +224,25 @@ def main():
 
     print(f"Quantizable tensors: {len(quant_keys)}")
 
-    # Optional: load model and collect Hessian diagonals
-    hessian_map = None
-    use_hessian = False
-    if args.calibration:
-        calib_path = Path(args.calibration)
-        if not calib_path.exists():
-            sys.exit(f"Calibration file not found: {calib_path}")
-        calibration_ids = np.load(str(calib_path))
-        print(f"Calibration data: {calibration_ids.shape}")
+    # Load model and collect Hessian diagonals
+    calib_path = Path(args.calibration)
+    if not calib_path.exists():
+        sys.exit(f"Calibration file not found: {calib_path}")
+    calibration_ids = np.load(str(calib_path))
+    print(f"Calibration data: {calibration_ids.shape}")
 
-        print("Loading BF16 model for activation capture...")
-        from mlx_lm.utils import load as mlx_load
-        model, _ = mlx_load(str(source))
-        model.eval()
+    print("Loading BF16 model for activation capture...")
+    from mlx_lm.utils import load as mlx_load
+    model, _ = mlx_load(str(source))
+    model.eval()
 
-        print("Wrapping linear layers...")
-        wrapped_paths = wrap_linear_layers(model)
-        print(f"  Wrapped {len(wrapped_paths)} layers")
+    print("Wrapping linear layers...")
+    wrapped_paths = wrap_linear_layers(model)
+    print(f"  Wrapped {len(wrapped_paths)} layers")
 
-        print(f"Running calibration (batch_size={args.batch_size})...")
-        hessian_map = _collect_activations(model, wrapped_paths, calibration_ids, batch_size=args.batch_size)
-        print(f"  Collected Hessian for {len(hessian_map)} layers")
-        use_hessian = True
+    print(f"Running calibration (batch_size={args.batch_size})...")
+    hessian_map = _collect_activations(model, wrapped_paths, calibration_ids, batch_size=args.batch_size)
+    print(f"  Collected Hessian for {len(hessian_map)} layers")
 
     # Build error database
     db = {"layers": {}, "param_counts": {}}
@@ -292,7 +265,10 @@ def main():
         param_count = int(tensor.size)
         db["param_counts"][base] = param_count
 
-        h_diag = hessian_map.get(base) if hessian_map is not None else None
+        h_diag = hessian_map.get(base)
+        if h_diag is None:
+            print(f"  SKIP {base}: no Hessian captured")
+            continue
 
         layer_errors = {}
         for bw in bitwidths:
@@ -309,14 +285,12 @@ def main():
             db["layers"][base] = layer_errors
 
         if (idx + 1) % 100 == 0 or (idx + 1) == total:
-            mode = "Hessian" if use_hessian else "Frobenius"
-            print(f"  [{idx+1}/{total}] {base} [{mode}] — "
+            print(f"  [{idx+1}/{total}] {base} [Hessian] — "
                   f"errors: " + ", ".join(f"{bw}={layer_errors[str(bw)]['error']:.6f}"
                                           for bw in bitwidths if str(bw) in layer_errors))
 
     output.write_text(json.dumps(db, indent=2))
-    mode = "Hessian-weighted" if use_hessian else "Frobenius"
-    print(f"\nWrote error_db.json ({mode}): {len(db['layers'])} layers, {len(all_errors)} measurements")
+    print(f"\nWrote error_db.json (Hessian-weighted): {len(db['layers'])} layers, {len(all_errors)} measurements")
     if all_errors:
         print(f"Error range: [{min(all_errors):.6f}, {max(all_errors):.6f}], mean={np.mean(all_errors):.6f}")
 

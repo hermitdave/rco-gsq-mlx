@@ -786,10 +786,8 @@ def main():
                     help="Uniform round-to-nearest quantization at --default-bits (no RCO allocation)")
     ap.add_argument("--error-db", default=None,
                     help="SLQ-style error_db.json path (skips imatrix/GGUF entirely)")
-    ap.add_argument("--gptq-errors", action="store_true",
-                    help="Build error_db with Hessian-weighted error measurement (requires --calibration)")
     ap.add_argument("--calibration", default=None,
-                    help="Path to calibration token IDs .npy file for Hessian-weighted error measurement")
+                    help="Path to calibration token IDs .npy for Hessian-weighted error_db (triggers auto-build)")
     ap.add_argument("--outlier-percentile", type=float, default=90.0,
                     help="Percentile threshold for outlier auto-protection (default: 90)")
     args = ap.parse_args()
@@ -870,10 +868,8 @@ def main():
         loss_table_path.write_text(json.dumps(rows, indent=2))
         print(f"  {len(rows)} groups, bitwidths={bitwidths_list}")
 
-    elif args.gptq_errors:
-        # Build error_db using Hessian-weighted error measurement
-        if not args.calibration:
-            sys.exit("--gptq-errors requires --calibration (path to .npy token IDs)")
+    elif args.calibration:
+        # Build Hessian-weighted error_db from calibration data
         calib_path = Path(args.calibration)
         if not calib_path.exists():
             sys.exit(f"Calibration file not found: {calib_path}")
