@@ -784,6 +784,10 @@ def main():
     ap.add_argument("--skip-quantize", action="store_true", help="Allocate + validate only")
     ap.add_argument("--error-db", default=None,
                     help="SLQ-style error_db.json path (skips imatrix/GGUF entirely)")
+    ap.add_argument("--gptq-errors", action="store_true",
+                    help="Use GPTQ-style Hessian-weighted error measurement (requires --calibration)")
+    ap.add_argument("--calibration", default=None,
+                    help="Path to calibration token IDs .npy file for GPTQ error measurement")
     ap.add_argument("--outlier-percentile", type=float, default=90.0,
                     help="Percentile threshold for outlier auto-protection (default: 90)")
     args = ap.parse_args()
@@ -804,11 +808,12 @@ def main():
 
     # Pre-load error_db if provided (used by outlier protection + expert unification)
     error_db = None
-    if args.error_db:
-        error_db_path = Path(args.error_db).expanduser()
-        if error_db_path.exists():
+    if args.error_db or args.gptq_errors:
+        db_path = Path(args.error_db) if args.error_db else (output / "work" / "error_db_gptq.json")
+        db_path = db_path.expanduser()
+        if db_path.exists():
             import json as _json
-            error_db = _json.loads(error_db_path.read_text()).get("layers", {})
+            error_db = _json.loads(db_path.read_text()).get("layers", {})
 
     # --- Step 1: introspect ---
     print("[1/5] introspecting model …")
@@ -838,6 +843,50 @@ def main():
             })
         loss_table_path.write_text(json.dumps(rows, indent=2))
         print(f"  {len(rows)} groups, bitwidths={bitwidths_list}")
+
+    elif args.gptq_errors:
+        # Build error_db using GPTQ-style Hessian-weighted error measurement
+        if not args.calibration:
+            sys.exit("--gptq-errors requires --calibration (path to .npy token IDs)")
+        calib_path = Path(args.calibration)
+        if not calib_path.exists():
+            sys.exit(f"Calibration file not found: {calib_path}")
+        print(f"[2/5] building GPTQ-style error_db with calibration: {calib_path}")
+        gptq_db_path = output / "work" / "error_db_gptq.json"
+        gptq_db_path.parent.mkdir(parents=True, exist_ok=True)
+        import subprocess
+        script = (
+            Path(__file__).parent.parent / "src" / "rco_mlx" / "scripts" / "build_error_db_gptq.py"
+        )
+        cmd = [
+            sys.executable, str(script),
+            "--source", str(source),
+            "--output", str(gptq_db_path),
+            "--model-type", args.model_type or "default",
+            "--calibration", str(calib_path),
+            "--bitwidths", args.bits,
+            "--group-size", str(args.group_size),
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            sys.exit(f"GPTQ error_db build failed:\n{result.stderr}")
+        print(result.stdout)
+        # Use the GPTQ error_db as the error source
+        error_db_path = gptq_db_path
+        losses, fracs, bitwidths = load_error_db(error_db_path)
+        loss_table_path.parent.mkdir(parents=True, exist_ok=True)
+        bitwidths_list = bitwidths.tolist()
+        rows = []
+        for i in range(len(fracs)):
+            rows.append({
+                "layer": f"group_{i}",
+                "tensor": f"group_{i}",
+                "params": int(fracs[i] * 1e6),
+                "mse": {str(b): float(losses[i, j]) for j, b in enumerate(bitwidths_list)},
+            })
+        loss_table_path.write_text(json.dumps(rows, indent=2))
+        print(f"  {len(rows)} groups, bitwidths={bitwidths_list}")
+
     elif not loss_table_path.exists():
         if not args.imatrix or not args.gguf_dir:
             sys.exit("Need --loss-table, --error-db, or both --imatrix and --gguf-dir")
