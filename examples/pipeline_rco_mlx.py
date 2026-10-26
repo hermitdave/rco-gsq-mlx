@@ -782,6 +782,8 @@ def main():
     ap.add_argument("--model-type", default=None,
                     help="Model type for adapter-based quantization (e.g. 'flint')")
     ap.add_argument("--skip-quantize", action="store_true", help="Allocate + validate only")
+    ap.add_argument("--rtn", action="store_true",
+                    help="Uniform round-to-nearest quantization at --default-bits (no RCO allocation)")
     ap.add_argument("--error-db", default=None,
                     help="SLQ-style error_db.json path (skips imatrix/GGUF entirely)")
     ap.add_argument("--gptq-errors", action="store_true",
@@ -820,6 +822,30 @@ def main():
     layer_names, param_counts, groups = introspect_model(source, args.group_spec)
     group_names = [g.layer_names[0] for g in groups]  # one representative per group
     print(f"  {len(layer_names)} layers, {len(groups)} groups")
+
+    # --- RTN short-circuit ---
+    if args.rtn:
+        print(f"[2/5] RTN mode: uniform {args.default_bits}-bit quantization")
+        assignment = {name: args.default_bits for name in layer_names if _is_quantizable(name + ".weight")}
+        print(f"  {len(assignment)} tensors @ {args.default_bits}-bit")
+        # Skip to emit + quantize
+        print("[3/5] skipping allocation (RTN)")
+        print("[4/5] emitting MLX config + validating …")
+        bf16_prefixes = None
+        if model_adapter is not None:
+            bf16_prefixes = model_adapter.non_quantized_prefixes()
+        cfg = emit_and_validate(
+            assignment, args.group_size, source, output, args.default_bits,
+            validate_on_disk=False,
+            bf16_prefixes=bf16_prefixes,
+        )
+        print("[5/5] streaming quantization …")
+        stream_quantize(source, output, assignment, args.group_size, model_adapter=model_adapter)
+        print(f"\n{'='*60}")
+        print(f"RTN complete. Output: {output}")
+        print(f"Config: {output / 'config.json'}")
+        print(f"{'='*60}")
+        return
 
     # --- Step 2: loss table ---
     loss_table_path = Path(args.loss_table) if args.loss_table else output / "work" / "imatrix_alloc.json"
