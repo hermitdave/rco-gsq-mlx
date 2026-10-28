@@ -180,6 +180,16 @@ def precalibrate_model(
                     tensors[key] = weight
                     continue
 
+                # Skip biases, norms, embeddings, lm_head
+                skip = False
+                for prefix in ["bias", "norm", "embed", "lm_head", "mtp"]:
+                    if prefix in key:
+                        skip = True
+                        break
+                if skip:
+                    tensors[key] = weight
+                    continue
+
                 if adapter is not None:
                     mapped = adapter.map_key_to_mlx(key)
                     if mapped is None:
@@ -205,7 +215,18 @@ def precalibrate_model(
 
         # Save shard
         out_path = output_dir / shard_path.name
-        save_file({k: mx.array(v) for k, v in tensors.items()}, str(out_path))
+        # safetensors.torch.save_file expects torch.Tensor, convert from mlx/numpy
+        import torch
+        torch_tensors = {}
+        for k, v in tensors.items():
+            if hasattr(v, 'tolist'):
+                # mlx array or numpy -> torch tensor
+                torch_tensors[k] = torch.tensor(v.tolist() if hasattr(v, 'tolist') else np.array(v).tolist())
+            elif isinstance(v, np.ndarray):
+                torch_tensors[k] = torch.from_numpy(v)
+            else:
+                torch_tensors[k] = v
+        save_file(torch_tensors, str(out_path))
 
     # Generate index
     index = {"metadata": {"total_size": total_params}, "weight_map": {}}

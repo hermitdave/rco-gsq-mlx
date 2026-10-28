@@ -990,7 +990,7 @@ def main():
     ap.add_argument("--precalibration", default=None, choices=["higgs"],
                     help="Pre-calibration method to apply before quantization (e.g. 'higgs')")
     ap.add_argument("--precalibration-alpha", type=float, default=0.05,
-                    help="HIGGS salient weight percentage (default: 0.05 = 5%)")
+                    help="HIGGS salient weight percentage (default: 0.05 = 5%%)")
     ap.add_argument("--bf16-prefixes", default="",
                     help="Comma-separated module path prefixes to keep BF16 (skip in quant config)")
     ap.add_argument("--model-type", default=None,
@@ -1045,7 +1045,13 @@ def main():
         # Build a mapping from layer_path -> group index
         name_to_idx = {name: i for i, name in enumerate(group_names)}
         # Find which groups have entries in the error DB
-        keep_indices = [name_to_idx[n] for n in group_names if n in db_layers]
+        # error_db keys may or may not have .weight suffix
+        keep_indices = []
+        for n in group_names:
+            if n in db_layers:
+                keep_indices.append(name_to_idx[n])
+            elif n + ".weight" in db_layers:
+                keep_indices.append(name_to_idx[n])
         if len(keep_indices) < len(group_names):
             print(f"  filtering groups: {len(group_names)} -> {len(keep_indices)} (only layers with error data)")
             group_names = [group_names[i] for i in keep_indices]
