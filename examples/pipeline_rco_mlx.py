@@ -42,6 +42,7 @@ from safetensors import safe_open
 # ---------------------------------------------------------------------------
 from rco_mlx import (
     LossTable,
+    MLX_SUPPORTED_BITS,
     MlxQuantConfig,
     allocation_to_config,
     attach_param_counts,
@@ -111,6 +112,92 @@ def introspect_model(source_dir: Path, group_spec: str | None = None):
     attach_param_counts(groups, param_counts)
 
     return layer_names, param_counts, groups
+
+
+def save_loss_table_from_error_db(error_db_path: Path, loss_table_path: Path):
+    """Load error_db and save canonical loss table JSON."""
+    losses, fracs, bitwidths = load_error_db(error_db_path)
+    loss_table_path.parent.mkdir(parents=True, exist_ok=True)
+    bitwidths_list = bitwidths.tolist()
+    rows = []
+    for i in range(len(fracs)):
+        rows.append({
+            "layer": f"group_{i}",
+            "tensor": f"group_{i}",
+            "params": int(fracs[i] * 1e6),
+            "mse": {str(b): float(losses[i, j]) for j, b in enumerate(bitwidths_list)},
+        })
+    loss_table_path.write_text(json.dumps(rows, indent=2))
+    print(f"  {len(rows)} groups, bitwidths={bitwidths_list}")
+    return losses, fracs, bitwidths
+
+
+# ---------------------------------------------------------------------------
+# Step 2: build calibration data from known corpora
+# ---------------------------------------------------------------------------
+def build_calibration_from_dataset(
+    source_dir: Path,
+    model_type: str,
+    dataset: str,
+    num_samples: int = 128,
+    seq_length: int = 2048,
+    out: Path | None = None,
+) -> Path:
+    """Download a known corpus, tokenize with the model's tokenizer, save .npy.
+
+    Supported datasets: 'wikitext', 'fineweb', 'c4'
+    """
+    from transformers import AutoTokenizer
+
+    # Load tokenizer from source dir or fall back to model name
+    tokenizer = AutoTokenizer.from_pretrained(str(source_dir), trust_remote_code=True)
+
+    print(f"[calib] loading dataset: {dataset} ({num_samples} samples x {seq_length} tokens)")
+
+    if dataset == "wikitext":
+        from datasets import load_dataset
+        ds = load_dataset("Salesforce/wikitext", "wikitext-2-raw-v1", split="test")
+        text = "\n".join(t for t in ds["text"] if t.strip())
+    elif dataset == "fineweb":
+        from datasets import load_dataset
+        ds = load_dataset("HuggingFaceFW/fineweb-edu", "default", split="train", streaming=True)
+        texts = []
+        for item in ds:
+            texts.append(item["text"])
+            if len(texts) >= num_samples:
+                break
+        text = "\n\n".join(texts)
+    elif dataset == "c4":
+        from datasets import load_dataset
+        ds = load_dataset("allenai/c4", "en", split="validation", streaming=True)
+        texts = []
+        for item in ds:
+            texts.append(item["text"])
+            if len(texts) >= num_samples:
+                break
+        text = "\n\n".join(texts)
+    else:
+        sys.exit(f"Unknown calibration dataset: {dataset}. Choose: wikitext, fineweb, c4")
+
+    # Tokenize
+    all_ids = tokenizer.encode(text)
+    # Truncate or pad to get exactly num_samples * seq_length tokens
+    target = num_samples * seq_length
+    if len(all_ids) < target:
+        # Repeat the text if too short
+        repeats = (target + len(all_ids) - 1) // len(all_ids)
+        all_ids = (all_ids * repeats)[:target]
+    else:
+        all_ids = all_ids[:target]
+
+    ids_np = np.array(all_ids, dtype=np.int32).reshape(num_samples, seq_length)
+
+    if out is None:
+        out = source_dir / "work" / f"calib_{dataset}_{num_samples}x{seq_length}.npy"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    np.save(str(out), ids_np)
+    print(f"[calib] saved {out} ({ids_np.shape})")
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -466,6 +553,12 @@ def stream_quantize(
         # strip any .weight suffix for the lookup
         clean = path.removesuffix(".weight")
         layer_bits[clean] = bits
+        # Also store under the MLX-mapped key so should_quantize() finds it
+        if model_adapter is not None:
+            mlx = model_adapter.map_key_to_mlx(path + ".weight")
+            if mlx:
+                layer_bits[mlx.removesuffix(".weight")] = bits
+                layer_bits[mlx] = bits
 
     # also build a lookup with .weight suffix for key matching
     layer_bits_with_suffix = {}
@@ -479,6 +572,11 @@ def stream_quantize(
             return None
         if key.startswith("model.language_model."):
             return "language_model.model." + key[len("model.language_model."):]
+        # Use adapter's mapping if available (handles w1->gate_proj etc.)
+        if model_adapter is not None:
+            mapped = model_adapter.map_key_to_mlx(key)
+            if mapped is not None:
+                return mapped
         return key
 
     def should_quantize(mlx_key: str) -> tuple[bool, int]:
@@ -490,6 +588,7 @@ def stream_quantize(
             or "mtp" in mlx_key
             or not mlx_key.endswith(".weight")
             or mlx_key.endswith(".bias")
+            or ".conv.conv." in mlx_key  # Conv1d not supported by MLX affine quant
         ):
             print(f"  SKIP quant: {mlx_key}")
             return False, 4
@@ -506,7 +605,30 @@ def stream_quantize(
         if bits is None:
             # try without .weight
             base = mlx_key[: -len(".weight")]
-            bits = layer_bits.get(base, 4)
+            bits = layer_bits.get(base, None)
+            # MoE expert fallback: if this is an individual expert tensor
+            # (model.layers.N.feed_forward.experts.E.wX), fall back to the
+            # stacked projection key (model.layers.N.feed_forward.wX) so all
+            # experts in a layer-projection get the same bitwidth.
+            if bits is None and ".experts." in base:
+                parts = base.split(".")
+                try:
+                    experts_idx = parts.index("experts")
+                    proj = parts[experts_idx + 2]
+                    l = parts[2]
+                    for prefix in ["feed_forward", "mlp"]:
+                        stacked_key = f"model.layers.{l}.{prefix}.{proj}"
+                        if stacked_key in layer_bits:
+                            bits = layer_bits[stacked_key]
+                            break
+                        # also try with .weight suffix variants
+                        if stacked_key + ".weight" in layer_bits_with_suffix:
+                            bits = layer_bits_with_suffix[stacked_key + ".weight"]
+                            break
+                except (ValueError, IndexError):
+                    pass
+        if bits is None:
+            bits = 4
         return True, bits
 
     shards = sorted(source_dir.glob("*.safetensors"))
@@ -539,12 +661,30 @@ def stream_quantize(
                         results[mlx_key] = torch.from_numpy(
                             np.array(q).astype(np.uint32)
                         )
-                        results[f"{base_key}.scales"] = torch.from_numpy(
-                            np.array(scales).astype(np.float16)
+                        # Default to float16 for scales/biases; fall back to float32
+                        # only if values overflow float16 range. Matches SLQ pattern:
+                        # max(abs(scales)) and max(abs(zeros)) <= 65,504 -> fp16.
+                        scales_np = np.array(scales)
+                        biases_np = np.array(biases)
+                        use_fp16 = (
+                            np.max(np.abs(scales_np)) <= 65504
+                            and np.max(np.abs(biases_np)) <= 65504
                         )
-                        results[f"{base_key}.biases"] = torch.from_numpy(
-                            np.array(biases).astype(np.float16)
-                        )
+                        if use_fp16:
+                            results[f"{base_key}.scales"] = torch.from_numpy(
+                                scales_np.astype(np.float16)
+                            )
+                            results[f"{base_key}.biases"] = torch.from_numpy(
+                                biases_np.astype(np.float16)
+                            )
+                        else:
+                            print(f"  {base_key}: overflow -> float32 scales/biases")
+                            results[f"{base_key}.scales"] = torch.from_numpy(
+                                scales_np.astype(np.float32)
+                            )
+                            results[f"{base_key}.biases"] = torch.from_numpy(
+                                biases_np.astype(np.float32)
+                            )
                     else:
                         results[mlx_key] = tensor.to(torch.bfloat16)
                 else:
@@ -561,6 +701,7 @@ def stream_quantize(
         print("\n[quant] post-processing: stacking MoE experts ...")
         _stack_experts(output_dir, model_adapter, group_size)
         _rewrite_config_for_stacked_experts(output_dir, assignment)
+        _rewrite_config_mlx_keys(output_dir, model_adapter)
         elapsed = time.time() - start
         print(f"  post-process done | {elapsed:.1f}s elapsed")
 
@@ -583,6 +724,8 @@ def _stack_experts(output_dir: Path, model_adapter, group_size: int):
     Reads all quantized shards, groups expert tensors by (layer, projection),
     stacks their weights/scales/biases along axis 0, and writes the stacked
     versions. Removes the individual expert tensors.
+
+    Handles both .mlp.experts. (Flint/OLMoE) and .feed_forward.experts. (LFM2.5).
     """
     import torch
     from safetensors.torch import load_file, save_file
@@ -599,14 +742,20 @@ def _stack_experts(output_dir: Path, model_adapter, group_size: int):
     # Find expert tensors to stack
     expert_patterns = []
     for key in list(all_tensors.keys()):
-        if ".mlp.experts." in key and key.endswith(".weight"):
-            # Parse: model.layers.{l}.mlp.experts.{e}.{proj}.weight
+        if ".experts." in key and key.endswith(".weight"):
             parts = key.split(".")
-            if len(parts) >= 6 and parts[4] == "experts":
-                l = parts[2]
-                e = parts[5]
-                proj = parts[6]
-                expert_patterns.append((l, e, proj, key))
+            # Find experts index dynamically
+            try:
+                experts_idx = parts.index("experts")
+            except ValueError:
+                continue
+            if len(parts) < experts_idx + 3:
+                continue
+            l = parts[2]
+            e = parts[experts_idx + 1]
+            proj = parts[experts_idx + 2]
+            prefix = ".".join(parts[3:experts_idx])
+            expert_patterns.append((l, e, proj, key, experts_idx, prefix))
 
     if not expert_patterns:
         print("  no expert tensors found to stack")
@@ -615,20 +764,23 @@ def _stack_experts(output_dir: Path, model_adapter, group_size: int):
     # Group by (layer, projection)
     from collections import defaultdict
     groups = defaultdict(list)
-    for l, e, proj, key in expert_patterns:
-        groups[(l, proj)].append((int(e), key))
+    for l, e, proj, key, experts_idx, prefix in expert_patterns:
+        groups[(l, proj)].append((int(e), key, experts_idx, prefix))
 
     stacked_count = 0
     for (l, proj), experts in sorted(groups.items()):
         experts.sort(key=lambda x: x[0])
         num_experts = len(experts)
+        experts_idx = experts[0][2]
+        prefix = experts[0][3]
 
-        # Collect weights, scales, biases for each expert
-        weight_key = f"model.layers.{l}.mlp.experts.0.{proj}.weight"
+        # Build key templates based on actual expert index position
+        weight_key = f"model.layers.{l}.{prefix}.experts.0.{proj}.weight"
         base_key = weight_key[:-len(".weight")]
         scales_key = f"{base_key}.scales"
         biases_key = f"{base_key}.biases"
 
+        # Check if any expert weight exists
         if weight_key not in all_tensors:
             continue
 
@@ -637,29 +789,29 @@ def _stack_experts(output_dir: Path, model_adapter, group_size: int):
         b0 = all_tensors.get(biases_key)
 
         # Stack weights along axis 0
-        weights_list = [all_tensors[f"model.layers.{l}.mlp.experts.{e}.{proj}.weight"] for e in range(num_experts)]
-        stacked_w = torch.cat(weights_list, dim=0)
+        weights_list = [all_tensors[f"model.layers.{l}.{prefix}.experts.{e}.{proj}.weight"] for e in range(num_experts)]
+        stacked_w = torch.cat([w for w in weights_list if w is not None], dim=0)
 
         # Stack scales and biases if present
         stacked_s = None
         stacked_b = None
         if s0 is not None:
-            scales_list = [all_tensors.get(f"model.layers.{l}.mlp.experts.{e}.{proj}.scales") for e in range(num_experts)]
+            scales_list = [all_tensors.get(f"model.layers.{l}.{prefix}.experts.{e}.{proj}.scales") for e in range(num_experts)]
             if all(s is not None for s in scales_list):
                 stacked_s = torch.cat(scales_list, dim=0)
         if b0 is not None:
-            biases_list = [all_tensors.get(f"model.layers.{l}.mlp.experts.{e}.{proj}.biases") for e in range(num_experts)]
+            biases_list = [all_tensors.get(f"model.layers.{l}.{prefix}.experts.{e}.{proj}.biases") for e in range(num_experts)]
             if all(b is not None for b in biases_list):
                 stacked_b = torch.cat(biases_list, dim=0)
 
         # Reshape from 2D concatenated to 3D (num_experts, rows, cols)
-        # MLX-LM expects 3D expert tensors, matching mx.stack() output in sanitize()
         num_experts = len(weights_list)
         w_rows, w_cols = stacked_w.shape
         stacked_w = stacked_w.view(num_experts, w_rows // num_experts, w_cols)
 
-        # Write stacked tensors
-        target_weight = f"model.layers.{l}.mlp.switch_mlp.{proj}.weight"
+        # Write stacked tensors with MLX key names (gate_proj/down_proj/up_proj)
+        proj_mlx = {"w1": "gate_proj", "w2": "down_proj", "w3": "up_proj"}.get(proj, proj)
+        target_weight = f"model.layers.{l}.{prefix}.switch_mlp.{proj_mlx}.weight"
         all_tensors[target_weight] = stacked_w
         target_base = target_weight[:-len(".weight")]
         if stacked_s is not None:
@@ -674,7 +826,7 @@ def _stack_experts(output_dir: Path, model_adapter, group_size: int):
         # Remove individual expert tensors
         for e in range(num_experts):
             for suffix in [".weight", ".scales", ".biases"]:
-                k = f"model.layers.{l}.mlp.experts.{e}.{proj}{suffix}"
+                k = f"model.layers.{l}.{prefix}.experts.{e}.{proj}{suffix}"
                 all_tensors.pop(k, None)
 
         stacked_count += 1
@@ -700,18 +852,28 @@ def _rewrite_config_for_stacked_experts(output_dir: Path, assignment: dict[str, 
     with open(cfg_path) as f:
         cfg = json.load(f)
     quant = cfg.get("quantization", {})
-    # Remove individual expert entries
-    to_remove = [k for k in quant if ".mlp.experts." in k]
+
+    # Remove individual expert entries (handles both .mlp.experts. and .feed_forward.experts.)
+    to_remove = [k for k in quant if ".experts." in k]
     for k in to_remove:
         del quant[k]
-    # Add switch_mlp entries
+
+    # Add switch_mlp entries from assignment
     added = 0
     for path, bits in assignment.items():
-        if ".mlp.experts." not in path:
+        if ".experts." not in path:
             continue
+        # Parse: model.layers.{l}.{prefix}.experts.{e}.{proj}
         parts = path.split(".")
-        l, proj = parts[2], parts[6]
-        switch_key = f"model.layers.{l}.mlp.switch_mlp.{proj}"
+        # Find experts index dynamically
+        try:
+            experts_idx = parts.index("experts")
+            l = parts[2]
+            proj = parts[experts_idx + 2]
+            prefix = ".".join(parts[3:experts_idx])
+        except (ValueError, IndexError):
+            continue
+        switch_key = f"model.layers.{l}.{prefix}.switch_mlp.{proj}"
         if switch_key not in quant:
             quant[switch_key] = {"group_size": 64, "bits": bits, "mode": "affine"}
             added += 1
@@ -719,6 +881,39 @@ def _rewrite_config_for_stacked_experts(output_dir: Path, assignment: dict[str, 
     with open(cfg_path, "w") as f:
         json.dump(cfg, f, indent=2)
     print(f"  rewrote config: removed {len(to_remove)} expert entries, added {added} switch_mlp entries")
+
+
+def _rewrite_config_mlx_keys(output_dir: Path, model_adapter):
+    """Rewrite config.json quantization keys from HF format to MLX format.
+
+    Uses the adapter's map_key_to_mlx to translate checkpoint keys to the
+    module paths that MLX-LM's loader expects after sanitize().
+    """
+    import json
+    cfg_path = output_dir / "config.json"
+    if not cfg_path.exists() or model_adapter is None:
+        return
+    with open(cfg_path) as f:
+        cfg = json.load(f)
+    quant = cfg.get("quantization", {})
+    new_quant = {}
+    for key, val in quant.items():
+        # Skip global defaults (no dots means not a module path)
+        if "." not in key:
+            new_quant[key] = val
+            continue
+        # Map HF key -> MLX key
+        mlx_key = model_adapter.map_key_to_mlx(key + ".weight")
+        if mlx_key is None:
+            # BF16 prefix - shouldn't be in quant config, but skip if present
+            continue
+        # Strip .weight suffix for module path
+        module_path = mlx_key[:-7] if mlx_key.endswith(".weight") else mlx_key
+        new_quant[module_path] = val
+    cfg["quantization"] = new_quant
+    with open(cfg_path, "w") as f:
+        json.dump(cfg, f, indent=2)
+    print(f"  rewrote {len(quant)} config keys to MLX format ({len(new_quant)} entries)")
 
 
 def _protect_outliers(assignment: dict[str, int], error_db: dict, target_bpw: float, percentile: float = 90.0):
@@ -731,10 +926,19 @@ def _protect_outliers(assignment: dict[str, int], error_db: dict, target_bpw: fl
     """
     layers = error_db
 
-    # Map layer_path -> error at target_bpw
+    # Find the closest available bitwidth in the error_db to target_bpw
+    all_bitwidths = set()
+    for path, bw_data in layers.items():
+        all_bitwidths.update(int(b) for b in bw_data.keys())
+    if not all_bitwidths:
+        return
+    sorted_bws = sorted(all_bitwidths)
+    closest_bw = min(sorted_bws, key=lambda bw: abs(bw - target_bpw))
+    bw_key = str(closest_bw)
+
+    # Map layer_path -> error at closest bitwidth
     errors = {}
     for path, bw_data in layers.items():
-        bw_key = str(int(target_bpw))
         if bw_key in bw_data:
             errors[path] = bw_data[bw_key].get("error", 0.0)
 
@@ -751,12 +955,16 @@ def _protect_outliers(assignment: dict[str, int], error_db: dict, target_bpw: fl
     for path, err in errors.items():
         if err > threshold:
             cur = assignment.get(path)
-            if cur is not None and cur < 8:
-                assignment[path] = cur + 1
-                bumped += 1
+            if cur is not None:
+                # Bump to next supported bitwidth, not cur+1
+                for bw in MLX_SUPPORTED_BITS:
+                    if bw > cur:
+                        assignment[path] = bw
+                        bumped += 1
+                        break
 
     if bumped > 0:
-        print(f"  [outliers] protected {bumped} layers above {percentile:.0f}th percentile (threshold={threshold:.6f})")
+        print(f"  [outliers] protected {bumped} layers above {percentile:.0f}th percentile (threshold={threshold:.6f}, bw={closest_bw})")
 
 
 def main():
@@ -788,6 +996,8 @@ def main():
                     help="SLQ-style error_db.json path (skips imatrix/GGUF entirely)")
     ap.add_argument("--calibration", default=None,
                     help="Path to calibration token IDs .npy for Hessian-weighted error_db (triggers auto-build)")
+    ap.add_argument("--calibration-dataset", default=None,
+                    help="Dataset name for automatic calibration: 'wikitext', 'fineweb', 'c4' (triggers auto-build)")
     ap.add_argument("--outlier-percentile", type=float, default=90.0,
                     help="Percentile threshold for outlier auto-protection (default: 90)")
     args = ap.parse_args()
@@ -808,9 +1018,8 @@ def main():
 
     # Pre-load error_db if provided (used by outlier protection + expert unification)
     error_db = None
-    if args.error_db or args.gptq_errors:
-        db_path = Path(args.error_db) if args.error_db else (output / "work" / "error_db_gptq.json")
-        db_path = db_path.expanduser()
+    if args.error_db:
+        db_path = Path(args.error_db).expanduser()
         if db_path.exists():
             import json as _json
             error_db = _json.loads(db_path.read_text()).get("layers", {})
@@ -853,20 +1062,39 @@ def main():
         if not error_db_path.exists():
             sys.exit(f"error_db not found: {error_db_path}")
         print(f"[2/5] loading SLQ error_db: {error_db_path}")
-        losses, fracs, bitwidths = load_error_db(error_db_path)
-        # Also save as the canonical loss table for downstream steps
-        loss_table_path.parent.mkdir(parents=True, exist_ok=True)
-        bitwidths_list = bitwidths.tolist()
-        rows = []
-        for i in range(len(fracs)):
-            rows.append({
-                "layer": f"group_{i}",
-                "tensor": f"group_{i}",
-                "params": int(fracs[i] * 1e6),
-                "mse": {str(b): float(losses[i, j]) for j, b in enumerate(bitwidths_list)},
-            })
-        loss_table_path.write_text(json.dumps(rows, indent=2))
-        print(f"  {len(rows)} groups, bitwidths={bitwidths_list}")
+        losses, fracs, bitwidths = save_loss_table_from_error_db(error_db_path, loss_table_path)
+
+    elif args.calibration_dataset:
+        # Auto-generate calibration data from known corpus
+        calib_path = build_calibration_from_dataset(
+            source_dir=source,
+            model_type=args.model_type or "default",
+            dataset=args.calibration_dataset,
+            num_samples=128,
+            seq_length=2048,
+        )
+        print(f"[2/5] building Hessian-weighted error_db with {args.calibration_dataset} calibration")
+        hessian_db_path = output / "work" / "error_db_hessian.json"
+        hessian_db_path.parent.mkdir(parents=True, exist_ok=True)
+        import subprocess
+        script = (
+            Path(__file__).parent.parent / "src" / "rco_mlx" / "scripts" / "build_error_db.py"
+        )
+        cmd = [
+            sys.executable, str(script),
+            "--source", str(source),
+            "--output", str(hessian_db_path),
+            "--model-type", args.model_type or "default",
+            "--calibration", str(calib_path),
+            "--bitwidths", args.bits,
+            "--group-size", str(args.group_size),
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            sys.exit(f"Hessian error_db build failed:\n{result.stderr}")
+        print(result.stdout)
+        error_db_path = hessian_db_path
+        losses, fracs, bitwidths = save_loss_table_from_error_db(error_db_path, loss_table_path)
 
     elif args.calibration:
         # Build Hessian-weighted error_db from calibration data
@@ -895,19 +1123,7 @@ def main():
         print(result.stdout)
         # Use the Hessian error_db as the error source
         error_db_path = hessian_db_path
-        losses, fracs, bitwidths = load_error_db(error_db_path)
-        loss_table_path.parent.mkdir(parents=True, exist_ok=True)
-        bitwidths_list = bitwidths.tolist()
-        rows = []
-        for i in range(len(fracs)):
-            rows.append({
-                "layer": f"group_{i}",
-                "tensor": f"group_{i}",
-                "params": int(fracs[i] * 1e6),
-                "mse": {str(b): float(losses[i, j]) for j, b in enumerate(bitwidths_list)},
-            })
-        loss_table_path.write_text(json.dumps(rows, indent=2))
-        print(f"  {len(rows)} groups, bitwidths={bitwidths_list}")
+        losses, fracs, bitwidths = save_loss_table_from_error_db(error_db_path, loss_table_path)
         # Pre-load error_db for outlier protection + expert unification
         if error_db is None:
             import json as _json
@@ -955,24 +1171,66 @@ def main():
     # For models with MoE experts, unify bitwidths per (layer, projection)
     # so that all experts in a group share the same bitwidth — required
     # for stacking into switch_mlp tensors.
-    if any(".mlp.experts." in p for p in assignment):
+    # Scan the source model to count actual experts per layer.
+    experts_per_layer: Dict[str, int] = {}
+    try:
+        from mlx_lm.utils import load_model
+        scan_model, _ = load_model(source, lazy=False, strict=False)
+        scan_model.eval()
+        for l_idx, layer in enumerate(scan_model.layers):
+            for attr in ["feed_forward", "mlp"]:
+                ffn = getattr(layer, attr, None)
+                if ffn is None:
+                    continue
+                # Lfm2MoeSparseMoeBlock stores experts inside switch_mlp as SwitchLinear
+                if hasattr(ffn, "switch_mlp"):
+                    smlp = ffn.switch_mlp
+                    proj_map = {"gate_proj": "w1", "up_proj": "w3", "down_proj": "w2"}
+                    for proj_attr, proj_name in proj_map.items():
+                        proj = getattr(smlp, proj_attr, None)
+                        if proj is not None and hasattr(proj, "weight") and proj.weight.ndim == 3:
+                            n = proj.weight.shape[0]
+                            experts_per_layer[f"{l_idx}.{proj_name}"] = n
+                elif hasattr(ffn, "experts"):
+                    n = len(ffn.experts)
+                    for proj in ["w1", "w2", "w3"]:
+                        experts_per_layer[f"{l_idx}.{proj}"] = n
+        del scan_model
+        mx.eval(mx.zeros(1))
+    except Exception:
+        pass
+
+    if experts_per_layer:
+        print(f"  detected MoE experts: {experts_per_layer}")
+
+    if any(".experts." in p for p in assignment) or any(
+        f"model.layers.{l}.feed_forward.{proj}" in assignment or f"model.layers.{l}.mlp.{proj}" in assignment
+        for l, proj in experts_per_layer
+    ):
         print("  unifying MoE expert bitwidths per layer-projection ...")
         from collections import Counter, defaultdict
 
         expert_groups = defaultdict(list)
         for path, bits in assignment.items():
-            if ".mlp.experts." in path:
-                parts = path.split(".")
-                l, proj = parts[2], parts[6]
+            if ".experts." not in path:
+                continue
+            parts = path.split(".")
+            try:
+                experts_idx = parts.index("experts")
+                l = parts[2]
+                proj = parts[experts_idx + 2]
+            except (ValueError, IndexError):
+                continue
+            expert_groups[(l, proj)].append(bits)
+        # Also build groups from stacked keys (feed_forward.wX / mlp.wX)
+        for path, bits in assignment.items():
+            if ".experts." in path:
+                continue
+            parts = path.split(".")
+            if len(parts) >= 5 and parts[2].isdigit() and parts[3] in ("feed_forward", "mlp") and parts[4].startswith("w"):
+                l = parts[2]
+                proj = parts[4]
                 expert_groups[(l, proj)].append(bits)
-        # Infer the number of experts per layer from the assignment keys
-        experts_per_layer: Dict[str, int] = {}
-        for path in assignment:
-            if ".mlp.experts." in path:
-                parts = path.split(".")
-                l, e, proj = parts[2], int(parts[5]), parts[6]
-                key = f"{l}.{proj}"
-                experts_per_layer[key] = max(experts_per_layer.get(key, 0), e + 1)
 
         # If an error_db is available, use it to pick the bitwidth that
         # minimizes aggregate error across experts. Otherwise fall back
@@ -987,12 +1245,15 @@ def main():
                     total_err = 0.0
                     count = 0
                     for e in range(experts_per_layer.get(f"{l}.{proj}", 0)):
-                        expert_key = f"model.layers.{l}.mlp.experts.{e}.{proj}"
-                        layer_data = error_db.get(expert_key, {})
-                        bw_data = layer_data.get(str(candidate_bw))
-                        if bw_data is not None:
-                            total_err += bw_data.get("error", 0.0)
-                            count += 1
+                        # Try both feed_forward and mlp prefixes
+                        for prefix in ["feed_forward", "mlp"]:
+                            expert_key = f"model.layers.{l}.{prefix}.experts.{e}.{proj}"
+                            layer_data = error_db.get(expert_key, {})
+                            bw_data = layer_data.get(str(candidate_bw))
+                            if bw_data is not None:
+                                total_err += bw_data.get("error", 0.0)
+                                count += 1
+                                break
                     if count > 0 and total_err < best_err:
                         best_err = total_err
                         best_bw = candidate_bw
@@ -1005,10 +1266,18 @@ def main():
 
             n_experts = experts_per_layer.get(f"{l}.{proj}", 0)
             for e in range(n_experts):
-                key = f"model.layers.{l}.mlp.experts.{e}.{proj}"
-                if key in assignment and assignment[key] != mode_bits:
-                    assignment[key] = mode_bits
-                    unified += 1
+                # Try both feed_forward and mlp prefixes
+                for prefix in ["feed_forward", "mlp"]:
+                    key = f"model.layers.{l}.{prefix}.experts.{e}.{proj}"
+                    if key in assignment:
+                        if assignment[key] != mode_bits:
+                            assignment[key] = mode_bits
+                            unified += 1
+                    else:
+                        # Key not in assignment — add it so all experts in this
+                        # layer-projection get the same bitwidth.
+                        assignment[key] = mode_bits
+                        unified += 1
         print(f"    unified {unified} expert assignments across {len(expert_groups)} groups")
 
     # Filter out BF16 tensors from the quant config
@@ -1054,6 +1323,7 @@ def main():
 def _print_summary(assignment, output, group_size, target_bpw, error_db):
     """Print a final summary of the quantization."""
     from collections import Counter
+    from rco_mlx.objective import effective_bits
 
     bit_hist = Counter(assignment.values())
     total_params = 0
@@ -1061,10 +1331,15 @@ def _print_summary(assignment, output, group_size, target_bpw, error_db):
         # Estimate params from layer name (rough)
         total_params += 1
 
+    # Compute effective bpw including per-group scale/bias overhead
+    actual_bits = np.array([effective_bits(int(bw), group_size) for bw in assignment.values()])
+    achieved_effective = float(actual_bits.mean())
+
     print(f"\n{'='*60}")
     print("QUANTIZATION SUMMARY")
     print(f"{'='*60}")
-    print(f"Target: {target_bpw:.2f} bpw")
+    print(f"Target: {target_bpw:.2f} bpw (nominal)")
+    print(f"Achieved effective bpw: {achieved_effective:.4f} (includes scale/bias overhead)")
     print(f"Group size: {group_size}")
     print(f"Quantized tensors: {len(assignment)}")
     print(f"Bitwidth distribution:")

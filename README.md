@@ -212,7 +212,30 @@ The `--error-db` flag skips the imatrix/GGUF dependency entirely. The pipeline
 loads the database, converts it to the same internal format as the legacy loss
 table, and runs the same RCO allocation.
 
+For Hessian-weighted error databases, you can either provide a pre-tokenized
+calibration file with `--calibration`, or let the pipeline download a known
+corpus automatically with `--calibration-dataset`:
+
+```bash
+python examples/pipeline_rco_mlx.py \
+    --source /path/to/bf16-model \
+    --output /path/to/output \
+    --target-bpw 4.0 \
+    --group-size 64 \
+    --model-type olmoe \
+    --calibration-dataset wikitext
+```
+
+Supported datasets: `wikitext` (Wikipedia, ~1.3M test tokens), `fineweb` (FineWeb-Edu),
+`c4` (C4 web text). The pipeline downloads the dataset, tokenizes it with the model's
+tokenizer, and saves a 128×2048 calibration `.npy` file in `work/calib_{dataset}.npy`.
+
+oMLX's SLQ uses similar corpora for calibration: built-in 600-sample multi-lingual
+mix (code, en/wiki/c4, ko/zh/ja wiki, tool_calling, reasoning) for small models,
+and extended sampling for MoE models until every expert has seen enough tokens.
+
 ---
+
 
 ## MLX integration
 
@@ -323,7 +346,16 @@ We validated the pipeline on [allenai/OLMoE-1B-7B-0125](https://huggingface.co/a
 - Savings are in storage/I/O, not RAM
 
 ```bash
-# Hessian-weighted error_db (best quality):
+# Hessian-weighted error_db (best quality) with known corpus:
+python examples/pipeline_rco_mlx.py \
+    --source /path/to/olmoe-bf16 \
+    --output /path/to/output \
+    --target-bpw 4.0 \
+    --group-size 64 \
+    --model-type olmoe \
+    --calibration-dataset wikitext
+
+# Or use a pre-tokenized calibration file:
 python examples/pipeline_rco_mlx.py \
     --source /path/to/olmoe-bf16 \
     --output /path/to/output \
