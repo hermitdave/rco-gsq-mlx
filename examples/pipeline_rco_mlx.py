@@ -149,8 +149,10 @@ def build_calibration_from_dataset(
     """
     from transformers import AutoTokenizer
 
-    # Load tokenizer from source dir or fall back to model name
-    tokenizer = AutoTokenizer.from_pretrained(str(source_dir), trust_remote_code=True)
+    # Load tokenizer from source dir
+    tokenizer = AutoTokenizer.from_pretrained(
+        str(source_dir), trust_remote_code=True, local_files_only=True
+    )
 
     print(f"[calib] loading dataset: {dataset} ({num_samples} samples x {seq_length} tokens)")
 
