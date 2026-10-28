@@ -3,10 +3,13 @@
 Implements the HIGGS algorithm from arXiv:2501.09107:
 - Weight classification into salient/non-salient via adaptive LASSO
 - Soft-thresholding: ŵ_i = sign(w_i) * ReLU(|w_i| - λ'/|w_i|)
-- Salient weights get higher bitwidth, non-salient get lower bitwidth
+- Salient weights protected, non-salient weights shrunk toward zero
 - No calibration data required
 
 This is a pre-processing step applied to BF16 weights before RCO quantization.
+Per the paper, the classification guides bitwidth assignment; we apply the
+soft-thresholding as a practical pre-calibration because MLX quantizes whole
+tensors uniformly, so we reshape the distribution rather than split masks.
 """
 
 from __future__ import annotations
@@ -32,6 +35,9 @@ def higgs_classify(
 ) -> np.ndarray:
     """Classify weights into salient (True) and non-salient (False) using HIGGS.
 
+    Uses adaptive LASSO with pseudo activations (identity matrix) to determine
+    a threshold λ' such that alpha percent of weights are classified as salient.
+
     Args:
         weight: 1D or 2D numpy array of weights
         alpha: percentage of weights to classify as salient (default 5%)
@@ -54,8 +60,8 @@ def higgs_classify(
     abs_w = np.abs(w_flat)
 
     def count_salient(lambda_prime):
-        # Soft-thresholding: ŵ = sign(w) * ReLU(|w| - λ'/|w|)
-        # Salient if |w| > λ'/|w|, i.e., |w|^2 > λ'
+        # Soft-thresholding criterion: salient if |w|^2 > λ'
+        # Equivalent to |w| > λ'/|w| from equation (5)
         return np.sum(abs_w * abs_w > lambda_prime)
 
     # Bisection for λ'
@@ -76,30 +82,32 @@ def higgs_classify(
 
 def apply_higgs(
     weight: np.ndarray,
-    salient_mask: np.ndarray,
-    salient_bits: int = 4,
-    non_salient_bits: int = 3,
+    alpha: float = 0.05,
 ) -> np.ndarray:
-    """Apply HIGGS pre-calibration: soft-thresholding + dual bitwidth assignment.
+    """Apply HIGGS pre-calibration: soft-thresholding non-salient weights.
+
+    Per the paper, the soft-thresholding ŵ = sign(w) * ReLU(|w| - λ'/|w|)
+    is derived from adaptive LASSO with pseudo activations. We apply it as
+    a pre-processing step because MLX quantizes whole tensors uniformly;
+    shrinking non-salient weights toward zero preserves their distribution
+    while making them less prone to quantization error.
 
     Args:
-        weight: original weight array
-        salient_mask: boolean mask from higgs_classify
-        salient_bits: bitwidth for salient weights
-        non_salient_bits: bitwidth for non-salient weights
+        weight: original weight array (numpy)
+        alpha: salient weight percentage (default 5%)
 
     Returns:
-        Pre-calibrated weight array (soft-thresholded)
+        Pre-calibrated weight array (same shape as input)
     """
     w = weight.copy()
+    salient_mask = higgs_classify(w, alpha=alpha)
+
+    # Compute λ' from the classification threshold
     abs_w = np.abs(w)
-
-    # Soft-thresholding for non-salient weights only
-    # λ' computed from the classification threshold
     lambda_prime = np.percentile(abs_w * abs_w, 100 * (1 - np.mean(salient_mask)))
-    threshold = lambda_prime / (abs_w + 1e-8)
 
-    # Apply soft-thresholding: ŵ = sign(w) * ReLU(|w| - λ'/|w|)
+    # Soft-thresholding: ŵ = sign(w) * ReLU(|w| - λ'/|w|)
+    threshold = lambda_prime / (abs_w + 1e-8)
     shrinkage = np.minimum(abs_w, threshold)
     w = np.sign(w) * shrinkage
 
@@ -184,7 +192,7 @@ def precalibrate_model(
                 salient_counts.append(n_salient)
 
                 # Soft-thresholding
-                calibrated = apply_higgs(weight, salient_mask, salient_bits, non_salient_bits)
+                calibrated = apply_higgs(weight, alpha=alpha)
 
                 tensors[key] = calibrated
                 total_params += weight.size

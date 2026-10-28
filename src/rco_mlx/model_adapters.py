@@ -264,7 +264,6 @@ class LFM2MoEAdapter(ModelAdapter):
             "norm",
             "layernorm",
             "embedding_norm",
-            "feed_forward.gate",
             "feed_forward.expert_bias",
             "conv.conv",  # Conv1d not supported by MLX affine quant
         ]
@@ -497,7 +496,7 @@ class OLMoEAdapter(ModelAdapter):
         "layernorm",      # input_layernorm, post_attention_layernorm
         "q_norm",         # per-head Q RMSNorm
         "k_norm",         # per-head K RMSNorm
-        "mlp.gate",       # router logits — extremely sensitive, must stay BF16
+        "mlp.gate",       # router logits — keep BF16 for stable expert routing
     )
 
     def enumerate_layers(self, source_dir: Path) -> List[Dict]:
@@ -570,11 +569,11 @@ class OLMoEAdapter(ModelAdapter):
 
         # Map individual MoE experts to stacked switch_mlp
         # HF: model.layers.{l}.mlp.experts.{e}.{gate,up,down}_proj.weight
-        # MLX: model.layers.{l}.mlp.switch_mlp.{gate,up,down}_proj.weight
+        # MLX: model.layers.{l}.mlp.switch_mlp.{gate,up,down}_proj
         if ".mlp.experts." in key:
             parts = key.split(".")
             # model.layers.{l}.mlp.experts.{e}.{proj}.weight
-            new_parts = parts[:4] + ["switch_mlp"] + parts[6:]  # drop experts.{e}
+            new_parts = parts[:4] + ["switch_mlp"] + parts[6:-1]  # drop experts.{e} and .weight
             return ".".join(new_parts)
 
         # Everything else (attention projs) maps through unchanged

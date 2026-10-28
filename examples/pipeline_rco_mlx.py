@@ -987,6 +987,10 @@ def main():
     ap.add_argument("--bits", default="2,3,4,6,8")
     ap.add_argument("--method", default="dp", choices=["dp", "greedy"],
                     help="Allocation method: 'dp' (RCO knapsack, default) or 'greedy' (SLQ-style)")
+    ap.add_argument("--precalibration", default=None, choices=["higgs"],
+                    help="Pre-calibration method to apply before quantization (e.g. 'higgs')")
+    ap.add_argument("--precalibration-alpha", type=float, default=0.05,
+                    help="HIGGS salient weight percentage (default: 0.05 = 5%)")
     ap.add_argument("--bf16-prefixes", default="",
                     help="Comma-separated module path prefixes to keep BF16 (skip in quant config)")
     ap.add_argument("--model-type", default=None,
@@ -1046,6 +1050,23 @@ def main():
             print(f"  filtering groups: {len(group_names)} -> {len(keep_indices)} (only layers with error data)")
             group_names = [group_names[i] for i in keep_indices]
 
+    # --- Pre-calibration ---
+    quant_source = source
+    if args.precalibration == "higgs":
+        print(f"[1.5/5] HIGGS pre-calibration (alpha={args.precalibration_alpha}) …")
+        from rco_mlx.higgs import precalibrate_model
+        precal_dir = output / "work" / "precalibrated"
+        precal_dir.mkdir(parents=True, exist_ok=True)
+        report = precalibrate_model(
+            source_dir=source,
+            output_dir=precal_dir,
+            alpha=args.precalibration_alpha,
+            adapter=model_adapter,
+        )
+        print(f"  HIGGS pre-calibration complete: {report['total_tensors']} tensors, "
+              f"mean salient ratio={report['mean_salient_ratio']:.4f}")
+        quant_source = precal_dir
+
     # --- RTN short-circuit ---
     if args.rtn:
         print(f"[2/5] RTN mode: uniform {args.default_bits}-bit quantization")
@@ -1058,12 +1079,12 @@ def main():
         if model_adapter is not None:
             bf16_prefixes = model_adapter.non_quantized_prefixes()
         cfg = emit_and_validate(
-            assignment, args.group_size, source, output, args.default_bits,
+            assignment, args.group_size, quant_source, output, args.default_bits,
             validate_on_disk=False,
             bf16_prefixes=bf16_prefixes,
         )
         print("[5/5] streaming quantization …")
-        stream_quantize(source, output, assignment, args.group_size, model_adapter=model_adapter)
+        stream_quantize(quant_source, output, assignment, args.group_size, model_adapter=model_adapter)
         print(f"\n{'='*60}")
         print(f"RTN complete. Output: {output}")
         print(f"Config: {output / 'config.json'}")
@@ -1083,7 +1104,7 @@ def main():
     elif args.calibration_dataset:
         # Auto-generate calibration data from known corpus
         calib_path = build_calibration_from_dataset(
-            source_dir=source,
+            source_dir=quant_source,
             model_type=args.model_type or "default",
             dataset=args.calibration_dataset,
             num_samples=128,
@@ -1098,7 +1119,7 @@ def main():
         )
         cmd = [
             sys.executable, str(script),
-            "--source", str(source),
+            "--source", str(quant_source),
             "--output", str(hessian_db_path),
             "--model-type", args.model_type or "default",
             "--calibration", str(calib_path),
@@ -1126,7 +1147,7 @@ def main():
         )
         cmd = [
             sys.executable, str(script),
-            "--source", str(source),
+            "--source", str(quant_source),
             "--output", str(hessian_db_path),
             "--model-type", args.model_type or "default",
             "--calibration", str(calib_path),
@@ -1191,7 +1212,7 @@ def main():
     experts_per_layer: Dict[str, int] = {}
     try:
         from mlx_lm.utils import load_model
-        scan_model, _ = load_model(source, lazy=False, strict=False)
+        scan_model, _ = load_model(quant_source, lazy=False, strict=False)
         scan_model.eval()
         for l_idx, layer in enumerate(scan_model.layers):
             for attr in ["feed_forward", "mlp"]:
@@ -1314,7 +1335,7 @@ def main():
     if model_adapter is not None:
         bf16_prefixes = model_adapter.non_quantized_prefixes()
     cfg = emit_and_validate(
-        assignment, args.group_size, source, output, args.default_bits,
+        assignment, args.group_size, quant_source, output, args.default_bits,
         validate_on_disk=args.skip_quantize,
         bf16_prefixes=bf16_prefixes,
     )
@@ -1325,7 +1346,7 @@ def main():
         return
 
     print("[5/5] streaming quantization …")
-    stream_quantize(source, output, assignment, args.group_size, model_adapter=model_adapter)
+    stream_quantize(quant_source, output, assignment, args.group_size, model_adapter=model_adapter)
 
     print(f"\n{'='*60}")
     print(f"Pipeline complete. Output: {output}")

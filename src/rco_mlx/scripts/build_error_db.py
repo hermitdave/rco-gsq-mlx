@@ -70,6 +70,22 @@ class _CaptureQuantized(nn.QuantizedLinear):
         return super().__call__(x)
 
 
+class _CaptureSwitchLinear(nn.Module):
+    """Drop-in replacement for SwitchLinear that stores the last input."""
+
+    def __init__(self, source):
+        super().__init__()
+        # Copy all attributes from source
+        for k in source.keys():
+            self[k] = source[k]
+        # Store reference to original for forward pass
+        self._original = source
+
+    def __call__(self, x, *args, **kwargs):
+        self._last_input = x
+        return self._original(x, *args, **kwargs)
+
+
 def _set_module_by_path(model, path: str, new_module):
     """Replace a module by dot-separated path, handling list indices."""
     parts = [p for p in path.split(".") if p]
@@ -92,7 +108,7 @@ def _get_module(model, path: str):
 
 
 def wrap_linear_layers(model):
-    """Wrap every nn.Linear to capture activations. Returns wrapped paths."""
+    """Wrap every nn.Linear and SwitchLinear to capture activations. Returns wrapped paths."""
     wrapped = []
     for name, _ in model.named_modules():
         if not name:
@@ -110,6 +126,10 @@ def wrap_linear_layers(model):
             wrapper.weight = obj.weight
             if "bias" in obj:
                 wrapper.bias = obj.bias
+            _set_module_by_path(model, name, wrapper)
+            wrapped.append(name)
+        elif type(obj).__name__ == "SwitchLinear" and not isinstance(obj, _CaptureSwitchLinear):
+            wrapper = _CaptureSwitchLinear(obj)
             _set_module_by_path(model, name, wrapper)
             wrapped.append(name)
         elif isinstance(obj, nn.QuantizedLinear) and not isinstance(obj, _CaptureQuantized):
@@ -269,7 +289,12 @@ def compute_kl_sensitivity(model, calibration_ids, bitwidths, group_size=64,
         try:
             # Quantize this module's weights
             # Convert bfloat16 to float32 before numpy to avoid PEP 3118 error
-            w_np = np.array(original_weight.astype(mx.float32))
+            # astype alone doesn't convert bfloat16 data; force via tolist()
+            try:
+                w_np = np.array(original_weight.tolist(), dtype=np.float32)
+            except Exception:
+                mx.eval(original_weight)
+                w_np = np.array(original_weight.tolist(), dtype=np.float32)
             recon = quantize_and_reconstruct(w_np, kl_bits, group_size)
             recon_mx = mx.array(recon, dtype=original_weight.dtype)
 
@@ -298,6 +323,7 @@ def compute_kl_sensitivity(model, calibration_ids, bitwidths, group_size=64,
             print(f"  KL [{idx+1}/{len(selected_modules)}] {name} = {kl_val:.6f}")
 
         except Exception as e:
+            import traceback; traceback.print_exc()
             print(f"  KL ERROR {name}: {e}")
             try:
                 module.weight = original_weight
@@ -428,11 +454,9 @@ def main():
 
     quant_keys = []
     for k in all_keys:
-        if not k.endswith(".weight"):
-            continue
-        base = k[:-7]
-        if is_quantizable(adapter, base):
-            quant_keys.append((base, weight_map[k]))
+        # Use the original key from the index/safetensors file directly
+        if is_quantizable(adapter, k):
+            quant_keys.append((k, weight_map[k]))
 
     print(f"Quantizable tensors: {len(quant_keys)}")
 
@@ -468,18 +492,34 @@ def main():
             continue
 
         with safe_open(str(shard_path), framework="pt", device="cpu") as f:
-            tensor = f.get_tensor(base + ".weight").float().numpy()
+            try:
+                tensor = f.get_tensor(base).float().numpy()
+            except Exception as e:
+                import traceback; traceback.print_exc()
+                print(f"  SKIP {base}: {e}")
+                continue
 
         if tensor.ndim != 2:
-            print(f"  SKIP {base}: not 2D ({tensor.ndim}D)")
-            continue
+            if tensor.ndim == 3:
+                # Stacked MoE expert tensor: reshape to 2D for error computation
+                # e.g., (128, 2048, 512) -> (128*2048, 512)
+                tensor = tensor.reshape(-1, tensor.shape[-1])
+            else:
+                print(f"  SKIP {base}: not 2D/3D ({tensor.ndim}D)")
+                continue
 
         param_count = int(tensor.size)
         db["param_counts"][base] = param_count
 
-        h_diag = hessian_map.get(base)
+        # Translate HF key to MLX module path for hessian lookup.
+        # map_key_to_mlx returns the MLX module path; hessian_map keys have no .weight suffix.
+        mapped = adapter.map_key_to_mlx(base) if adapter else base
+        mapped = mapped.removesuffix(".weight") if mapped.endswith(".weight") else mapped
+        h_diag = hessian_map.get(mapped)
         if h_diag is None:
-            print(f"  SKIP {base}: no Hessian captured")
+            h_diag = hessian_map.get(base)
+        if h_diag is None:
+            print(f"  SKIP {base}: no Hessian captured (tried {mapped})")
             continue
 
         layer_errors = {}
@@ -490,6 +530,7 @@ def main():
                 layer_errors[str(bw)] = {"error": err}
                 all_errors.append(err)
             except Exception as e:
+                import traceback; traceback.print_exc()
                 print(f"  ERROR {base} @ {bw}-bit: {e}")
                 continue
 
