@@ -350,6 +350,11 @@ optimizer, manifold primitives, and grouping logic here are a port of
 Port and MLX integration by **Hermit Dave**, produced with **Hermes Agent**
 (Nous Research).
 
+The true streaming quantization approach (layer-by-layer error database
+construction without loading the full BF16 model into memory) is inspired by
+[oMLX](https://github.com/jundot/omlx) (`omlx/oq.py`), specifically the
+`_iter_streamed_layer_blocks` and `_streamed_sensitivity_layer` patterns.
+
 ---
 
 ## License
