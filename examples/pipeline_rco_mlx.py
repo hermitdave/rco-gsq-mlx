@@ -1018,6 +1018,12 @@ def main():
     output = Path(args.output).expanduser().resolve()
     output.mkdir(parents=True, exist_ok=True)
 
+    # --- Step 1: introspect ---
+    print("[1/5] introspecting model …")
+    layer_names, param_counts, groups = introspect_model(source, args.group_spec)
+    group_names = [g.layer_names[0] for g in groups]  # one representative per group
+    print(f"  {len(layer_names)} layers, {len(groups)} groups")
+
     # Pre-load error_db if provided (used by outlier protection + expert unification)
     error_db = None
     if args.error_db:
@@ -1026,11 +1032,19 @@ def main():
             import json as _json
             error_db = _json.loads(db_path.read_text()).get("layers", {})
 
-    # --- Step 1: introspect ---
-    print("[1/5] introspecting model …")
-    layer_names, param_counts, groups = introspect_model(source, args.group_spec)
-    group_names = [g.layer_names[0] for g in groups]  # one representative per group
-    print(f"  {len(layer_names)} layers, {len(groups)} groups")
+    # If using an error_db, filter group_names to only the quantizable
+    # layers that actually have error data.  This avoids mismatches when
+    # the introspected layer count (775: includes norms, embeddings, …)
+    # differs from the error_db layer count (248: only Linear/QuantizedLinear).
+    if error_db is not None:
+        db_layers = set(error_db.keys())
+        # Build a mapping from layer_path -> group index
+        name_to_idx = {name: i for i, name in enumerate(group_names)}
+        # Find which groups have entries in the error DB
+        keep_indices = [name_to_idx[n] for n in group_names if n in db_layers]
+        if len(keep_indices) < len(group_names):
+            print(f"  filtering groups: {len(group_names)} -> {len(keep_indices)} (only layers with error data)")
+            group_names = [group_names[i] for i in keep_indices]
 
     # --- RTN short-circuit ---
     if args.rtn:
