@@ -27,6 +27,7 @@ __all__ = [
     "LFM2Adapter",
     "FlintAdapter",
     "LFM2MoEAdapter",
+    "Qwen3NextMoEAdapter",
     "register",
     "get",
 ]
@@ -324,118 +325,6 @@ class LFM2MoEAdapter(ModelAdapter):
 # Flint adapter (hybrid MoE)
 # ---------------------------------------------------------------------------
 
-@register("qwen3_5_moe")
-class Qwen3NextMoEAdapter(ModelAdapter):
-    """Adapter for Qwen3.5 MoE / Groot models (model_type: qwen3_5_moe).
-
-    Architecture: 40 layers (10 full_attention + 30 linear_attention),
-    128 routed experts + 1 shared, top-8 routing.
-    Experts are stored as stacked SwitchLinear: weight shape (128, in, out).
-    """
-
-    model_type = "qwen3_5_moe"
-    default_group_size = 64
-    default_bits = 4
-
-    # Keys that must stay BF16 regardless of RCO assignment
-    _BF16_PREFIXES = (
-        "embed_tokens",
-        "lm_head",
-        "norm",
-        "layernorm",
-        "embedding_norm",
-        "mlp.gate",  # router logits
-        "dt_bias",
-        "A_log",
-        "shared_expert_gate",
-    )
-
-    def enumerate_layers(self, source_dir: Path) -> List[Dict]:
-        with open(source_dir / "config.json") as f:
-            cfg = json.load(f)
-
-        # Groot puts model config under text_config
-        text_cfg = cfg.get("text_config", cfg)
-        num_layers = text_cfg.get("num_hidden_layers", 40)
-        layer_types = text_cfg.get("layer_types", [])
-
-        shards = sorted(source_dir.glob("*.safetensors"))
-        param_counts: Dict[str, int] = {}
-        # Read ALL shards for weight keys (later layers may be in later shards)
-        for shard_path in shards:
-            with safe_open(str(shard_path), framework="pt", device="cpu") as f:
-                for key in f.keys():
-                    if key.endswith(".weight"):
-                        param_counts[key] = int(f.get_tensor(key).numel())
-
-        layers = []
-        for idx in range(num_layers):
-            # Groot uses model.language_model.layers.{idx}.
-            prefix = f"model.language_model.layers.{idx}."
-            weight_keys = [k for k in param_counts if k.startswith(prefix)]
-            layer_type = layer_types[idx] if idx < len(layer_types) else "block"
-            layers.append({
-                "index": idx,
-                "type": layer_type,
-                "weight_keys": weight_keys,
-                "param_count": sum(param_counts[k] for k in weight_keys),
-            })
-        return layers
-
-    def quant_predicate(self, layer_descriptor: Dict) -> Optional[Dict]:
-        return {
-            "bits": self.default_bits,
-            "group_size": self.default_group_size,
-        }
-
-    def grouping_spec(self) -> Optional[str]:
-        return (
-            "self_attn.q_proj,self_attn.k_proj,self_attn.v_proj,self_attn.o_proj"
-            " model.layers.N.mlp.switch_mlp.up_proj"
-            " model.layers.N.mlp.switch_mlp.down_proj"
-            " model.layers.N.mlp.switch_mlp.gate_proj"
-            " linear_attn.in_proj_qkv"
-            " linear_attn.in_proj_z"
-            " linear_attn.in_proj_b"
-            " linear_attn.in_proj_a"
-            " linear_attn.out_proj"
-        )
-
-    def non_quantized_prefixes(self) -> List[str]:
-        return list(self._BF16_PREFIXES)
-
-    def load_calibration(
-        self, source_dir: Path, n_samples: int = 512, seq_len: int = 2048
-    ) -> np.ndarray:
-        """Calibration must come from a real text dataset, not random noise."""
-        raise RuntimeError(
-            "Calibration requires a real dataset. "
-            "Use --calibration-dataset fineweb|wikitext|c4, or pass --calibration <npy>."
-        )
-
-    def map_key_to_mlx(self, key: str) -> Optional[str]:
-        # Groot stores stacked experts as gate_up_proj + down_proj
-        # MLX-LM expects switch_mlp.gate_proj, up_proj, down_proj
-        if ".mlp.experts.down_proj." in key:
-            return key.replace(".mlp.experts.down_proj.", ".mlp.switch_mlp.down_proj.")
-        if ".mlp.experts.gate_up_proj." in key:
-            # Map to gate_proj; up_proj is derived from the same tensor during load
-            return key.replace(".mlp.experts.gate_up_proj.", ".mlp.switch_mlp.gate_proj.")
-        # Shared expert
-        if ".mlp.shared_expert." in key:
-            mlx = key.replace(".mlp.shared_expert.gate_proj.", ".mlp.shared_expert.gate_proj.")
-            mlx = mlx.replace(".mlp.shared_expert.up_proj.", ".mlp.shared_expert.up_proj.")
-            mlx = mlx.replace(".mlp.shared_expert.down_proj.", ".mlp.shared_expert.down_proj.")
-            return mlx
-        # Linear attention
-        if ".linear_attn." in key:
-            return key
-        # Self attention
-        if ".self_attn." in key:
-            return key
-        return key
-
-
 @register("flint")
 class FlintAdapter(ModelAdapter):
     model_type = "flint"
@@ -566,15 +455,13 @@ class FlintAdapter(ModelAdapter):
         if ".mlp.gate_proj." in key:
             return None
 
-        # Stack MoE experts into a single MLX tensor path
+        # Map individual MoE experts to stacked switch_mlp
         # HF: model.layers.{l}.mlp.experts.{e}.{gate,up,down}_proj.weight
-        # MLX: model.layers.{l}.mlp.experts.{gate,up,down}_proj.weight
-        # (experts are stacked along dim 0 in MLX)
+        # MLX: model.layers.{l}.mlp.switch_mlp.{gate,up,down}_proj.weight
         if ".mlp.experts." in key:
-            # Strip the expert index
             parts = key.split(".")
             # model.layers.{l}.mlp.experts.{e}.{proj}.weight
-            new_parts = parts[:4] + parts[5:]  # remove experts.{e}
+            new_parts = parts[:4] + ["switch_mlp"] + parts[5:]  # replace experts.{e} with switch_mlp
             return ".".join(new_parts)
 
         # Shared expert: rename shared_experts → shared_expert (singular)
@@ -681,11 +568,14 @@ class OLMoEAdapter(ModelAdapter):
             if key.startswith(f"model.{prefix}.") or key == f"model.{prefix}":
                 return None
 
-        # Experts: keep the experts.N path so the pipeline's _stack_experts
-        # post-processing can stack them into switch_mlp tensors.
-        # MLX-LM's olmoe loader also accepts both formats.
+        # Map individual MoE experts to stacked switch_mlp
+        # HF: model.layers.{l}.mlp.experts.{e}.{gate,up,down}_proj.weight
+        # MLX: model.layers.{l}.mlp.switch_mlp.{gate,up,down}_proj.weight
         if ".mlp.experts." in key:
-            return key
+            parts = key.split(".")
+            # model.layers.{l}.mlp.experts.{e}.{proj}.weight
+            new_parts = parts[:4] + ["switch_mlp"] + parts[6:]  # drop experts.{e}
+            return ".".join(new_parts)
 
         # Everything else (attention projs) maps through unchanged
         return key
@@ -777,3 +667,110 @@ class DefaultAdapter(ModelAdapter):
         if key.startswith("mtp."):
             return key
         return key
+
+
+# ---------------------------------------------------------------------------
+# Qwen3.5 / Groot MoE adapter (next-gen Qwen MoE, e.g. Groot-19B-A3B)
+# ---------------------------------------------------------------------------
+
+@register("qwen3_5_moe")
+class Qwen3NextMoEAdapter(ModelAdapter):
+    """Adapter for Qwen3.5-style MoE models (e.g. Groot-19B-A3B-261023).
+
+    Architecture: 40 layers (10 full-attention, 30 linear-attention),
+    128 experts top-8, stacked gate_up_proj + down_proj.
+    Model path: model.language_model.model.layers.{idx}.
+    """
+
+    model_type = "qwen3_5_moe"
+    default_group_size = 64
+    default_bits = 4
+
+    # Keys that must stay BF16 regardless of RCO assignment
+    _BF16_PREFIXES = (
+        "embed_tokens",
+        "lm_head",
+        "norm",
+        "layernorm",
+        "q_norm",
+        "k_norm",
+        "mlp.gate",
+        "conv.conv",
+        "linear_attn.conv1d",
+    )
+
+    def enumerate_layers(self, source_dir: Path) -> List[Dict]:
+        with open(source_dir / "config.json") as f:
+            cfg = json.load(f)
+
+        # Groot puts model config under text_config
+        text_cfg = cfg.get("text_config", cfg)
+        num_layers = text_cfg.get("num_hidden_layers", 40)
+        layer_types = text_cfg.get("layer_types", [])
+
+        shards = sorted(source_dir.glob("*.safetensors"))
+        param_counts: Dict[str, int] = {}
+        for shard_path in shards:
+            with safe_open(str(shard_path), framework="pt", device="cpu") as f:
+                for key in f.keys():
+                    if key.endswith(".weight"):
+                        param_counts[key] = int(f.get_tensor(key).numel())
+
+        layers = []
+        for idx in range(num_layers):
+            prefix = f"model.language_model.layers.{idx}."
+            weight_keys = [k for k in param_counts if k.startswith(prefix)]
+            layer_type = layer_types[idx] if idx < len(layer_types) else "block"
+            layers.append({
+                "index": idx,
+                "type": layer_type,
+                "weight_keys": weight_keys,
+                "param_count": sum(param_counts[k] for k in weight_keys),
+            })
+        return layers
+
+    def quant_predicate(self, layer_descriptor: Dict) -> Optional[Dict]:
+        return {
+            "bits": self.default_bits,
+            "group_size": self.default_group_size,
+        }
+
+    def grouping_spec(self) -> Optional[str]:
+        return (
+            "self_attn.q_proj,self_attn.k_proj,self_attn.v_proj,self_attn.o_proj"
+            " linear_attn.in_proj_a,linear_attn.in_proj_b,linear_attn.in_proj_qkv,linear_attn.in_proj_z,linear_attn.out_proj"
+            " model.language_model.layers.N.mlp.experts.N.down_proj"
+            " model.language_model.layers.N.mlp.experts.N.gate_up_proj"
+        )
+
+    def non_quantized_prefixes(self) -> List[str]:
+        return list(self._BF16_PREFIXES)
+
+    def load_calibration(
+        self, source_dir: Path, n_samples: int = 512, seq_len: int = 2048
+    ) -> np.ndarray:
+        raise RuntimeError(
+            "Calibration requires a real dataset. "
+            "Use --calibration-dataset fineweb|wikitext|c4, or pass --calibration <npy>."
+        )
+
+    def map_key_to_mlx(self, key: str) -> Optional[str]:
+        # Groot HF keys: model.language_model.layers.N...
+        # MLX module paths: model.language_model.model.layers.N...
+        # Step 1: strip leading "model."
+        mlx = key
+        if mlx.startswith("model."):
+            mlx = mlx[len("model."):]
+        # Step 2: insert ".model" after "language_model"
+        mlx = mlx.replace("language_model.layers", "language_model.model.layers")
+
+        # Groot stores stacked experts as gate_up_proj + down_proj
+        # MLX-LM expects switch_mlp.gate_proj, up_proj, down_proj
+        if ".mlp.experts.down_proj" in mlx:
+            mlx = mlx.replace(".mlp.experts.down_proj", ".mlp.switch_mlp.down_proj")
+        if ".mlp.experts.gate_up_proj" in mlx:
+            mlx = mlx.replace(".mlp.experts.gate_up_proj", ".mlp.switch_mlp.gate_proj")
+        if ".mlp.shared_expert." in mlx:
+            mlx = mlx.replace(".mlp.shared_expert.down_proj.", ".mlp.shared_expert.down_proj.")
+            mlx = mlx.replace(".mlp.shared_expert.gate_up_proj.", ".mlp.shared_expert.gate_proj.")
+        return mlx
