@@ -29,21 +29,18 @@ import numpy as np
 def higgs_classify(
     weight: np.ndarray,
     alpha: float = 0.05,
-    lambda_start: float = 10.0,
-    lambda_end: float = 0.001,
-    max_iter: int = 100,
 ) -> np.ndarray:
     """Classify weights into salient (True) and non-salient (False) using HIGGS.
 
     Uses adaptive LASSO with pseudo activations (identity matrix) to determine
     a threshold λ' such that alpha percent of weights are classified as salient.
 
+    A weight w_i is salient if |w_i|^2 > λ', which is equivalent to
+    |w_i| > λ'/|w_i| from equation (5) in the paper.
+
     Args:
         weight: 1D or 2D numpy array of weights
         alpha: percentage of weights to classify as salient (default 5%)
-        lambda_start: starting λ' value (large = all non-salient)
-        lambda_end: ending λ' value (small = all salient)
-        max_iter: bisection iterations
 
     Returns:
         Boolean mask: True = salient, False = non-salient
@@ -57,25 +54,10 @@ def higgs_classify(
     if n_salient_target >= n:
         return np.ones(n, dtype=bool)
 
-    abs_w = np.abs(w_flat)
-
-    def count_salient(lambda_prime):
-        # Soft-thresholding criterion: salient if |w|^2 > λ'
-        # Equivalent to |w| > λ'/|w| from equation (5)
-        return np.sum(abs_w * abs_w > lambda_prime)
-
-    # Bisection for λ'
-    lo, hi = lambda_start, lambda_end
-    for _ in range(max_iter):
-        mid = (lo + hi) / 2.0
-        n_salient = count_salient(mid)
-        if n_salient > n_salient_target:
-            lo = mid  # too many salient, increase threshold
-        else:
-            hi = mid  # too few salient, decrease threshold
-
-    lambda_prime = (lo + hi) / 2.0
-    salient_mask = abs_w * abs_w > lambda_prime
+    # Compute λ' directly from percentile: λ' is at (1-α) percentile of |w|^2
+    abs_w_sq = w_flat ** 2
+    lambda_prime = np.percentile(abs_w_sq, 100.0 * (1.0 - alpha))
+    salient_mask = abs_w_sq > lambda_prime
 
     return salient_mask
 
@@ -100,16 +82,18 @@ def apply_higgs(
         Pre-calibrated weight array (same shape as input)
     """
     w = weight.copy()
-    salient_mask = higgs_classify(w, alpha=alpha)
+    w_flat = w.flatten()
 
-    # Compute λ' from the classification threshold
-    abs_w = np.abs(w)
-    lambda_prime = np.percentile(abs_w * abs_w, 100 * (1 - np.mean(salient_mask)))
+    # Compute λ' directly from percentile
+    abs_w_sq = w_flat ** 2
+    lambda_prime = np.percentile(abs_w_sq, 100.0 * (1.0 - alpha))
 
     # Soft-thresholding: ŵ = sign(w) * ReLU(|w| - λ'/|w|)
+    abs_w = np.abs(w_flat)
     threshold = lambda_prime / (abs_w + 1e-8)
     shrinkage = np.minimum(abs_w, threshold)
-    w = np.sign(w) * shrinkage
+    w_flat = np.sign(w_flat) * shrinkage
+    w = w_flat.reshape(w.shape)
 
     return w
 
@@ -196,7 +180,7 @@ def precalibrate_model(
                         tensors[key] = weight
                         continue
 
-                # Apply HIGGS classification
+                # Compute salient count for reporting
                 salient_mask = higgs_classify(weight, alpha=alpha)
                 n_salient = int(np.sum(salient_mask))
                 salient_counts.append(n_salient)
