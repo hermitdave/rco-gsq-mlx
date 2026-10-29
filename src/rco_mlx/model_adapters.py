@@ -567,14 +567,12 @@ class OLMoEAdapter(ModelAdapter):
             if key.startswith(f"model.{prefix}.") or key == f"model.{prefix}":
                 return None
 
-        # Map individual MoE experts to stacked switch_mlp
+        # Keep individual expert keys so _stack_experts can find them
         # HF: model.layers.{l}.mlp.experts.{e}.{gate,up,down}_proj.weight
-        # MLX: model.layers.{l}.mlp.switch_mlp.{gate,up,down}_proj
+        # MLX: model.layers.{l}.mlp.experts.{e}.{gate,up,down}_proj.weight
+        # (stacking is done by _stack_experts post-processing)
         if ".mlp.experts." in key:
-            parts = key.split(".")
-            # model.layers.{l}.mlp.experts.{e}.{proj}.weight
-            new_parts = parts[:4] + ["switch_mlp"] + parts[6:-1]  # drop experts.{e} and .weight
-            return ".".join(new_parts)
+            return key
 
         # Everything else (attention projs) maps through unchanged
         return key

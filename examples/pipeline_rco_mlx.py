@@ -1278,6 +1278,10 @@ def main():
         # If an error_db is available, use it to pick the bitwidth that
         # minimizes aggregate error across experts. Otherwise fall back
         # to the mode (most common bitwidth).
+        # Map gate/up/down to w1/w2/w3 to match experts_per_layer keys
+        proj_to_w = {"gate_proj": "w1", "up_proj": "w3", "down_proj": "w2"}
+        w_to_proj = {v: k for k, v in proj_to_w.items()}
+
         unified = 0
         for (l, proj), bits_list in expert_groups.items():
             if error_db is not None:
@@ -1287,7 +1291,10 @@ def main():
                 for candidate_bw in sorted(set(bits_list)):
                     total_err = 0.0
                     count = 0
-                    for e in range(experts_per_layer.get(f"{l}.{proj}", 0)):
+                    # Look up experts_per_layer using w1/w2/w3 naming
+                    w_key = proj_to_w.get(proj, proj)
+                    n_experts = experts_per_layer.get(f"{l}.{w_key}", 0)
+                    for e in range(n_experts):
                         # Try both feed_forward and mlp prefixes
                         for prefix in ["feed_forward", "mlp"]:
                             expert_key = f"model.layers.{l}.{prefix}.experts.{e}.{proj}"
@@ -1307,7 +1314,8 @@ def main():
             else:
                 mode_bits = Counter(bits_list).most_common(1)[0][0]
 
-            n_experts = experts_per_layer.get(f"{l}.{proj}", 0)
+            w_key = proj_to_w.get(proj, proj)
+            n_experts = experts_per_layer.get(f"{l}.{w_key}", 0)
             for e in range(n_experts):
                 # Try both feed_forward and mlp prefixes
                 for prefix in ["feed_forward", "mlp"]:
