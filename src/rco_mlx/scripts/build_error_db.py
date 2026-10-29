@@ -107,6 +107,62 @@ def _get_module(model, path: str):
     return obj
 
 
+# ---------------------------------------------------------------------------
+# MoE helper utilities (used when --moe-enhance is active)
+# ---------------------------------------------------------------------------
+def _is_expert_path(layer_path: str) -> bool:
+    return ".experts." in layer_path
+
+
+def _extract_layer_idx(layer_path: str) -> int | None:
+    parts = layer_path.split(".")
+    for i, p in enumerate(parts):
+        if p == "layers" and i + 1 < len(parts) and parts[i + 1].isdigit():
+            return int(parts[i + 1])
+    return None
+
+
+def _map_expert_to_switch_mlx(layer_path: str) -> str | None:
+    """Map an individual expert HF path to its shared switch_mlp module path.
+
+    Examples
+    --------
+    model.layers.0.mlp.experts.12.w1  -> model.layers.0.switch_mlp.w1
+    model.layers.0.mlp.experts.12.w2  -> model.layers.0.switch_mlp.w2
+    model.layers.0.mlp.experts.12.w3  -> model.layers.0.switch_mlp.w3
+    model.layers.3.feed_forward.experts.5.gate_proj -> model.layers.3.switch_mlp.gate_proj
+    """
+    parts = layer_path.split(".")
+    try:
+        experts_idx = parts.index("experts")
+    except ValueError:
+        return None
+    if experts_idx + 2 >= len(parts):
+        return None
+    # Determine projection name: could be w1/w2/w3 or gate_proj/up_proj/down_proj
+    proj = parts[experts_idx + 2]
+    # Map w1/w2/w3 -> gate/up/down if needed
+    w_to_proj = {"w1": "gate_proj", "w2": "down_proj", "w3": "up_proj"}
+    proj = w_to_proj.get(proj, proj)
+    # Reconstruct: prefix before 'experts' + switch_mlp + proj
+    prefix = ".".join(parts[:experts_idx])
+    return f"{prefix}.switch_mlp.{proj}"
+
+
+def _spectral_heavy_tailedness(W: np.ndarray) -> float:
+    """Cheap proxy for PL_Alpha_Hill (log-mean minus log-median of |W|)."""
+    W = np.asarray(W, dtype=np.float64)
+    flat = np.abs(W.reshape(-1))
+    flat = flat[flat > 1e-12]
+    if flat.size == 0:
+        return 0.0
+    mean_abs = np.mean(flat)
+    median_abs = np.median(flat)
+    if median_abs < 1e-12:
+        return 0.0
+    return float(np.log(mean_abs) - np.log(median_abs))
+
+
 def wrap_linear_layers(model):
     """Wrap every nn.Linear and SwitchLinear to capture activations. Returns wrapped paths."""
     wrapped = []
@@ -139,14 +195,15 @@ def wrap_linear_layers(model):
     return wrapped
 
 
-def _collect_activations(model, wrapped_paths, calibration_ids, batch_size=4):
+def _collect_activations(model, wrapped_paths, calibration_ids, batch_size=4, moe_enhance=False):
     """Run calibration data and compute per-layer Hessian diagonals.
 
     Returns:
-        dict: layer_path -> hessian_diag (1-D numpy array, shape: in_features)
+        tuple: (hessian dict, activation_counts dict)
     """
     n_samples = calibration_ids.shape[0]
     accum = {p: None for p in wrapped_paths}
+    act_counts = {p: 0 for p in wrapped_paths} if moe_enhance else {}
     total_tokens = 0
 
     for i in range(0, n_samples, batch_size):
@@ -173,12 +230,14 @@ def _collect_activations(model, wrapped_paths, calibration_ids, batch_size=4):
             else:
                 accum[path] += ss
             total_tokens += x_np.shape[0] * (x_np.shape[1] if x_np.ndim > 1 else 1)
+            if moe_enhance:
+                act_counts[path] += x_np.shape[0] * (x_np.shape[1] if x_np.ndim > 1 else 1)
 
     hessian = {}
     for path, ss in accum.items():
         if ss is not None:
             hessian[path] = ss / total_tokens
-    return hessian
+    return hessian, act_counts
 
 
 # ---------------------------------------------------------------------------
@@ -390,6 +449,10 @@ def main():
                     help="Number of calibration samples for KL sensitivity (default: 8)")
     ap.add_argument("--kl-bits", type=int, default=4,
                     help="Reference bitwidth for KL sensitivity measurement (default: 4)")
+    ap.add_argument("--moe-enhance", action="store_true",
+                    help="Enable MoE-specific metadata collection: per-expert activation "
+                         "counts and spectral heavy-tailedness scores. Stores _meta on each "
+                         "layer for downstream enhancement.")
     args = ap.parse_args()
 
     source = Path(args.source)
@@ -477,8 +540,13 @@ def main():
     print(f"  Wrapped {len(wrapped_paths)} layers")
 
     print(f"Running calibration (batch_size={args.batch_size})...")
-    hessian_map = _collect_activations(model, wrapped_paths, calibration_ids, batch_size=args.batch_size)
+    hessian_map, activation_counts = _collect_activations(
+        model, wrapped_paths, calibration_ids, batch_size=args.batch_size,
+        moe_enhance=args.moe_enhance,
+    )
     print(f"  Collected Hessian for {len(hessian_map)} layers")
+    if args.moe_enhance:
+        print(f"  Collected activation counts for {len(activation_counts)} layers")
 
     # Build error database
     db = {"layers": {}, "param_counts": {}}
@@ -518,11 +586,28 @@ def main():
         h_diag = hessian_map.get(mapped)
         if h_diag is None:
             h_diag = hessian_map.get(base)
+        if h_diag is None and _is_expert_path(base):
+            # Fallback: map individual expert tensor to the shared switch_mlp
+            # projection path.  All experts in a layer-projection share the same
+            # input activations, so the Hessian captured at the switch_mlp level
+            # applies to every expert in that group.
+            shared = _map_expert_to_switch_mlx(base)
+            if shared:
+                h_diag = hessian_map.get(shared)
+                if h_diag is not None:
+                    print(f"  [fallback] {base} -> {shared} for Hessian")
         if h_diag is None:
             print(f"  SKIP {base}: no Hessian captured (tried {mapped})")
             continue
 
         layer_errors = {}
+        spectral_score = None
+        if args.moe_enhance and _is_expert_path(base):
+            # Compute spectral heavy-tailedness on the 2D tensor.
+            try:
+                spectral_score = _spectral_heavy_tailedness(tensor)
+            except Exception:
+                spectral_score = 0.0
         for bw in bitwidths:
             try:
                 reconstructed = quantize_and_reconstruct(tensor, bw, args.group_size)
@@ -535,6 +620,17 @@ def main():
                 continue
 
         if layer_errors:
+            # Attach MoE metadata when requested.
+            if args.moe_enhance:
+                meta = {}
+                act_count = activation_counts.get(mapped, activation_counts.get(base, 0))
+                meta["activation_count"] = act_count
+                if spectral_score is not None:
+                    meta["spectral_score"] = float(spectral_score)
+                layer_idx = _extract_layer_idx(base)
+                meta["layer_depth"] = layer_idx if layer_idx is not None else -1
+                meta["is_expert"] = _is_expert_path(base)
+                layer_errors["_meta"] = meta
             db["layers"][base] = layer_errors
 
         if (idx + 1) % 100 == 0 or (idx + 1) == total:

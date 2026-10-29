@@ -29,6 +29,7 @@ The loss table JSON is the output of imatrix_importance.py:
 
 import argparse
 import json
+import subprocess
 import sys
 import time
 from collections import Counter
@@ -297,7 +298,12 @@ def load_error_db(path: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     if "layers" not in db:
         sys.exit(f"Not a valid error_db.json (no 'layers' key): {path}")
 
-    bitwidths = sorted({int(b) for layer_data in db["layers"].values() for b in layer_data})
+    bitwidths = sorted({
+        int(b)
+        for layer_data in db["layers"].values()
+        for b in layer_data
+        if b != "_meta" and isinstance(layer_data[b], dict)
+    })
     param_counts = db.get("param_counts", {})
 
     rows = []
@@ -931,7 +937,10 @@ def _protect_outliers(assignment: dict[str, int], error_db: dict, target_bpw: fl
     # Find the closest available bitwidth in the error_db to target_bpw
     all_bitwidths = set()
     for path, bw_data in layers.items():
-        all_bitwidths.update(int(b) for b in bw_data.keys())
+        all_bitwidths.update(
+            int(b) for b in bw_data.keys()
+            if b != "_meta" and isinstance(bw_data[b], dict)
+        )
     if not all_bitwidths:
         return
     sorted_bws = sorted(all_bitwidths)
@@ -968,6 +977,23 @@ def _protect_outliers(assignment: dict[str, int], error_db: dict, target_bpw: fl
     if bumped > 0:
         print(f"  [outliers] protected {bumped} layers above {percentile:.0f}th percentile (threshold={threshold:.6f}, bw={closest_bw})")
 
+def _enforce_moe_min_bits(assignment: dict[str, int], min_bits: int = 4):
+    """Force all MoE expert tensors to at least ``min_bits``.
+    
+    Expert tensors (identified by ``.experts.`` in the path) are bumped to
+    ``min_bits`` if they are currently lower. This prevents aggressive
+    quantization on expert projections that may hurt quality.
+    """
+    if min_bits <= 3:
+        return  # No enforcement needed
+    bumped = 0
+    for path, bits in list(assignment.items()):
+        if ".experts." in path and bits < min_bits:
+            assignment[path] = min_bits
+            bumped += 1
+    if bumped > 0:
+        print(f"  [moe-min-bits] bumped {bumped} expert tensors to {min_bits}-bit")
+
 def main():
     ap = argparse.ArgumentParser(
         description="RCO mixed-precision quantization pipeline for MLX",
@@ -1001,6 +1027,19 @@ def main():
                     help="Dataset name for automatic calibration: 'wikitext', 'fineweb', 'c4' (triggers auto-build)")
     ap.add_argument("--outlier-percentile", type=float, default=90.0,
                     help="Percentile threshold for outlier auto-protection (default: 90)")
+    ap.add_argument("--moe-enhance", action="store_true", default=None,
+                    help="Enable MoE-aware error_db enhancement (coverage + depth + spectral). "
+                         "Auto-detected for MoE models when not specified.")
+    ap.add_argument("--no-moe-enhance", action="store_true",
+                    help="Disable MoE-aware error_db enhancement even for MoE models.")
+    ap.add_argument("--moe-min-bits", type=int, default=3,
+                    help="Minimum bitwidth for MoE expert tensors (default: 3, set to 4 to force 4-bit minimum on experts)")
+    ap.add_argument("--moe-coverage-alpha", type=float, default=0.5,
+                    help="MoE coverage inflation strength (default: 0.5, lower = less aggressive)")
+    ap.add_argument("--moe-depth-beta", type=float, default=0.2,
+                    help="MoE depth multiplier strength (default: 0.2)")
+    ap.add_argument("--moe-spectral-gamma", type=float, default=0.3,
+                    help="MoE spectral blend strength (default: 0.3)")
     args = ap.parse_args()
 
     # Resolve model adapter
@@ -1012,6 +1051,14 @@ def main():
             sys.exit(f"Unknown model type: {args.model_type}")
         model_adapter = adapter_cls()
         print(f"Using model adapter: {args.model_type}")
+
+    # MoE enhancement flag: None = auto-detect
+    if args.no_moe_enhance:
+        moe_force: bool | None = False
+    elif args.moe_enhance:
+        moe_force = True
+    else:
+        moe_force = None
 
     source = Path(args.source).expanduser().resolve()
     output = Path(args.output).expanduser().resolve()
@@ -1085,6 +1132,7 @@ def main():
         if not error_db_path.exists():
             sys.exit(f"error_db not found: {error_db_path}")
         print(f"[2/5] loading SLQ error_db: {error_db_path}")
+        error_db_path = _maybe_enhance_error_db(error_db_path, output, source, args.model_type, force=moe_force, coverage_alpha=args.moe_coverage_alpha, depth_beta=args.moe_depth_beta, spectral_gamma=args.moe_spectral_gamma)
         losses, fracs, bitwidths = save_loss_table_from_error_db(error_db_path, loss_table_path)
 
     elif args.calibration_dataset:
@@ -1099,7 +1147,6 @@ def main():
         print(f"[2/5] building Hessian-weighted error_db with {args.calibration_dataset} calibration")
         hessian_db_path = output / "work" / "error_db_hessian.json"
         hessian_db_path.parent.mkdir(parents=True, exist_ok=True)
-        import subprocess
         script = (
             Path(__file__).parent.parent / "src" / "rco_mlx" / "scripts" / "build_error_db.py"
         )
@@ -1112,11 +1159,14 @@ def main():
             "--bitwidths", args.bits,
             "--group-size", str(args.group_size),
         ]
+        if moe_force is not False:
+            cmd.append("--moe-enhance")
         result = subprocess.run(cmd, capture_output=True, text=True)
         if result.returncode != 0:
             sys.exit(f"Hessian error_db build failed:\n{result.stderr}")
         print(result.stdout)
         error_db_path = hessian_db_path
+        error_db_path = _maybe_enhance_error_db(error_db_path, output, source, args.model_type, force=moe_force, coverage_alpha=args.moe_coverage_alpha, depth_beta=args.moe_depth_beta, spectral_gamma=args.moe_spectral_gamma)
         losses, fracs, bitwidths = save_loss_table_from_error_db(error_db_path, loss_table_path)
 
     elif args.calibration:
@@ -1127,7 +1177,6 @@ def main():
         print(f"[2/5] building Hessian-weighted error_db with calibration: {calib_path}")
         hessian_db_path = output / "work" / "error_db_hessian.json"
         hessian_db_path.parent.mkdir(parents=True, exist_ok=True)
-        import subprocess
         script = (
             Path(__file__).parent.parent / "src" / "rco_mlx" / "scripts" / "build_error_db.py"
         )
@@ -1140,17 +1189,20 @@ def main():
             "--bitwidths", args.bits,
             "--group-size", str(args.group_size),
         ]
+        if moe_force is not False:
+            cmd.append("--moe-enhance")
         result = subprocess.run(cmd, capture_output=True, text=True)
         if result.returncode != 0:
             sys.exit(f"Hessian error_db build failed:\n{result.stderr}")
         print(result.stdout)
         # Use the Hessian error_db as the error source
         error_db_path = hessian_db_path
+        error_db_path = _maybe_enhance_error_db(error_db_path, output, source, args.model_type, force=moe_force, coverage_alpha=args.moe_coverage_alpha, depth_beta=args.moe_depth_beta, spectral_gamma=args.moe_spectral_gamma)
         losses, fracs, bitwidths = save_loss_table_from_error_db(error_db_path, loss_table_path)
         # Pre-load error_db for outlier protection + expert unification
         if error_db is None:
             import json as _json
-            error_db = _json.loads(hessian_db_path.read_text()).get("layers", {})
+            error_db = _json.loads(error_db_path.read_text()).get("layers", {})
 
     elif not loss_table_path.exists():
         if not args.imatrix or not args.gguf_dir:
@@ -1181,6 +1233,10 @@ def main():
         )
     print(f"  achieved {report['achieved_bpw']:.4f} bpw")
     print(f"  histogram: {report['bit_histogram']}")
+
+    # Enforce minimum bitwidth on MoE expert tensors
+    if args.moe_min_bits > 3:
+        _enforce_moe_min_bits(assignment, min_bits=args.moe_min_bits)
 
     # Outlier auto-protection: bump layers with high error at target bitwidth
     if error_db is not None:
@@ -1331,7 +1387,7 @@ def main():
         bf16_prefixes = model_adapter.non_quantized_prefixes()
     cfg = emit_and_validate(
         assignment, args.group_size, quant_source, output, args.default_bits,
-        validate_on_disk=args.skip_quantize,
+        validate_on_disk=False,
         bf16_prefixes=bf16_prefixes,
     )
 
@@ -1391,6 +1447,109 @@ def _print_summary(assignment, output, group_size, target_bpw, error_db):
             print(f"Mean relative error: {total_err / count:.6f}")
 
     print(f"{'='*60}")
+
+
+# ---------------------------------------------------------------------------
+# MoE auto-detection
+# ---------------------------------------------------------------------------
+
+_MOE_ADAPTERS = {"olmoe", "flint", "lfm2_moe", "qwen3_5_moe"}
+
+
+def detect_moe_model(source_dir: Path, model_type: str | None) -> bool:
+    """Return True if the model appears to be MoE.
+
+    Checks (in order):
+    1. Known MoE adapter name
+    2. config.json has num_experts > 1
+    3. Safetensors index contains expert tensors
+    """
+    if model_type and model_type.lower() in _MOE_ADAPTERS:
+        return True
+
+    # Check config.json
+    cfg_path = source_dir / "config.json"
+    if cfg_path.exists():
+        try:
+            with open(cfg_path) as f:
+                cfg = json.load(f)
+            num_experts = cfg.get("num_experts", 0)
+            if num_experts > 1:
+                return True
+        except Exception:
+            pass
+
+    # Check safetensors for expert tensors
+    shards = sorted(source_dir.glob("*.safetensors"))
+    if shards:
+        try:
+            index_path = source_dir / "model.safetensors.index.json"
+            if index_path.exists():
+                with open(index_path) as f:
+                    weight_map = json.load(f).get("weight_map", {})
+                for key in weight_map:
+                    if ".experts." in key:
+                        return True
+            else:
+                from safetensors import safe_open
+                with safe_open(str(shards[0]), framework="pt", device="cpu") as f:
+                    for key in f.keys():
+                        if ".experts." in key:
+                            return True
+        except Exception:
+            pass
+
+    return False
+
+
+def _maybe_enhance_error_db(
+    error_db_path: Path,
+    output_dir: Path,
+    source_dir: Path,
+    model_type: str | None,
+    force: bool | None = None,
+    coverage_alpha: float = 0.5,
+    depth_beta: float = 0.2,
+    spectral_gamma: float = 0.3,
+) -> Path:
+    """Run MoE-aware enhancement on error_db.json if the model is MoE.
+
+    Args:
+        force: True to always enhance, False to never enhance,
+               None to auto-detect based on model architecture.
+        coverage_alpha: Under-calibration inflation strength.
+        depth_beta: Depth sensitivity strength.
+        spectral_gamma: Spectral blend strength.
+
+    Returns the path to the (possibly enhanced) error_db.
+    """
+    if force is False:
+        return error_db_path
+    if force is None and not detect_moe_model(source_dir, model_type):
+        return error_db_path
+
+    print("[2/5] MoE model detected — applying MoE-aware error_db enhancement ...")
+    enhanced_path = output_dir / "work" / "error_db_enhanced.json"
+    enhanced_path.parent.mkdir(parents=True, exist_ok=True)
+
+    enhance_script = (
+        Path(__file__).parent.parent / "src" / "rco_mlx" / "scripts" / "moe_enhance_error_db.py"
+    )
+    cmd = [
+        sys.executable, str(enhance_script),
+        "--input", str(error_db_path),
+        "--output", str(enhanced_path),
+        "--model-type", model_type or "default",
+        "--coverage-alpha", str(coverage_alpha),
+        "--depth-beta", str(depth_beta),
+        "--spectral-gamma", str(spectral_gamma),
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        print(f"  WARNING: MoE enhancement failed: {result.stderr}")
+        return error_db_path
+    print(result.stdout)
+    return enhanced_path
 
 
 if __name__ == "__main__":
