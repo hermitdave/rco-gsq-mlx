@@ -1,15 +1,14 @@
-"""HIGGS pre-calibration for RCO quantization.
+"""HIGGS classification-only pre-calibration for RCO quantization.
 
 Implements the HIGGS algorithm from arXiv:2501.09107:
 - Weight classification into salient/non-salient via adaptive LASSO
-- Soft-thresholding: ŵ_i = sign(w_i) * ReLU(|w_i| - λ'/|w_i|)
-- Salient weights protected, non-salient weights shrunk toward zero
+- Classification guides bitwidth assignment (not weight modification)
+- Salient weights get higher bitwidth, non-salient get lower bitwidth
 - No calibration data required
 
-This is a pre-processing step applied to BF16 weights before RCO quantization.
-Per the paper, the classification guides bitwidth assignment; we apply the
-soft-thresholding as a practical pre-calibration because MLX quantizes whole
-tensors uniformly, so we reshape the distribution rather than split masks.
+This is a classification step applied to BF16 weights before RCO quantization.
+Per the paper, equation (5) is for classification only; we do NOT modify weights.
+The classification results are used to adjust bitwidth assignment in the pipeline.
 """
 
 from __future__ import annotations
@@ -185,8 +184,10 @@ def precalibrate_model(
                 n_salient = int(np.sum(salient_mask))
                 salient_counts.append(n_salient)
 
-                # Soft-thresholding
-                calibrated = apply_higgs(weight, alpha=alpha)
+                # Do NOT modify weights - classification only
+                # (soft-thresholding per equation (5) is for classification,
+                # not weight modification per arXiv:2501.09107)
+                calibrated = weight
 
                 tensors[key] = calibrated
                 total_params += weight.size
@@ -232,6 +233,13 @@ def precalibrate_model(
         "mean_salient_ratio": float(np.mean([s / t for s, t in zip(salient_counts, [v["total"] for v in layer_stats.values()])])) if layer_stats else 0.0,
         "layer_stats": layer_stats,
     }
+
+    # Save classification report for pipeline integration
+    report_path = output_dir / "work" / "higgs_classification.json"
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(report_path, "w") as f:
+        json.dump(report, f, indent=2)
+    print(f"  saved classification report to {report_path}")
 
     return report
 

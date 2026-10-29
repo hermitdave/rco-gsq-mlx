@@ -969,6 +969,78 @@ def _protect_outliers(assignment: dict[str, int], error_db: dict, target_bpw: fl
         print(f"  [outliers] protected {bumped} layers above {percentile:.0f}th percentile (threshold={threshold:.6f}, bw={closest_bw})")
 
 
+def _apply_higgs_classifications(assignment: dict[str, int], quant_source: Path, target_bpw: float):
+    """Adjust bitwidths based on HIGGS salient/non-salient classification.
+
+    Loads the HIGGS classification report from the pre-calibrated model and
+    bumps salient tensors by +1 bitwidth (up to max) and drops non-salient
+    tensors by -1 bitwidth (down to min). This implements the paper's
+    guidance that salient weights should receive higher precision.
+    """
+    report_path = quant_source / "work" / "higgs_classification.json"
+    if not report_path.exists():
+        print("  [higgs] no classification report found, skipping")
+        return
+
+    with open(report_path) as f:
+        report = json.load(f)
+
+    layer_stats = report.get("layer_stats", {})
+    if not layer_stats:
+        print("  [higgs] empty classification report, skipping")
+        return
+
+    # Thresholds for salient/non-salient adjustment
+    SALIENT_THRESHOLD = 0.10   # >10% salient -> bump +1 bit
+    NON_SALIENT_THRESHOLD = 0.02  # <2% salient -> drop -1 bit
+
+    bumped = 0
+    dropped = 0
+    for path, bits in assignment.items():
+        # Match assignment key to layer_stats key
+        # Assignment may use feed_forward/mlp prefix, with or without .weight
+        # layer_stats uses mlp prefix with .weight suffix
+        stat = None
+        candidates = [
+            path,
+            path.removesuffix(".weight"),
+            path.replace("feed_forward", "mlp"),
+            path.replace("feed_forward", "mlp").removesuffix(".weight"),
+            # Also try adding .weight suffix
+            path + ".weight" if not path.endswith(".weight") else None,
+            path.replace("feed_forward", "mlp") + ".weight" if not path.replace("feed_forward", "mlp").endswith(".weight") else None,
+        ]
+        for candidate in candidates:
+            if candidate is None:
+                continue
+            stat = layer_stats.get(candidate)
+            if stat is not None:
+                break
+
+        if stat is None:
+            continue
+
+        ratio = stat.get("ratio", 0.0)
+        if ratio > SALIENT_THRESHOLD and bits < max(MLX_SUPPORTED_BITS):
+            # Bump salient tensors to next supported bitwidth
+            for bw in MLX_SUPPORTED_BITS:
+                if bw > bits:
+                    assignment[path] = bw
+                    bumped += 1
+                    break
+        elif ratio < NON_SALIENT_THRESHOLD and bits > min(MLX_SUPPORTED_BITS):
+            # Drop non-salient tensors to next lower supported bitwidth
+            sorted_bws = sorted(MLX_SUPPORTED_BITS)
+            for bw in reversed(sorted_bws):
+                if bw < bits:
+                    assignment[path] = bw
+                    dropped += 1
+                    break
+
+    if bumped > 0 or dropped > 0:
+        print(f"  [higgs] adjusted {bumped} salient tensors (+1 bit), {dropped} non-salient tensors (-1 bit)")
+
+
 def main():
     ap = argparse.ArgumentParser(
         description="RCO mixed-precision quantization pipeline for MLX",
@@ -1210,6 +1282,10 @@ def main():
             args.target_bpw,
             percentile=args.outlier_percentile,
         )
+
+    # HIGGS classification-based bitwidth adjustment
+    if args.precalibration == "higgs":
+        _apply_higgs_classifications(assignment, quant_source, args.target_bpw)
 
     # For models with MoE experts, unify bitwidths per (layer, projection)
     # so that all experts in a group share the same bitwidth — required
