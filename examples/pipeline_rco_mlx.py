@@ -1006,7 +1006,7 @@ def main():
     # Resolve model adapter
     model_adapter = None
     if args.model_type:
-        from rco_mlx.model_adapters import get
+        from rco_mlx.adapters import get
         adapter_cls = get(args.model_type)
         if adapter_cls is None:
             sys.exit(f"Unknown model type: {args.model_type}")
@@ -1228,7 +1228,8 @@ def main():
 
     if any(".experts." in p for p in assignment) or any(
         f"model.layers.{l}.feed_forward.{proj}" in assignment or f"model.layers.{l}.mlp.{proj}" in assignment
-        for l, proj in experts_per_layer
+        for key in experts_per_layer
+        for l, proj in [key.split(".", 1)]
     ):
         print("  unifying MoE expert bitwidths per layer-projection ...")
         from collections import Counter, defaultdict

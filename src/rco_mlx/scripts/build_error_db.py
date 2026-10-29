@@ -35,7 +35,7 @@ import mlx.nn as nn
 import numpy as np
 from safetensors import safe_open
 
-from rco_mlx.model_adapters import get
+from rco_mlx.adapters import get
 
 
 # ---------------------------------------------------------------------------

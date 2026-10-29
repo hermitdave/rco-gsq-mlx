@@ -8,7 +8,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from rco_mlx.model_adapters import FlintAdapter, LFM2Adapter, get, register
+from rco_mlx.adapters import FlintAdapter, LFM2Adapter, get, register
 
 
 def _write_fake_lfm2(root: Path):

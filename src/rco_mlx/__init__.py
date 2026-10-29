@@ -45,7 +45,17 @@ from .mlx_alloc import (
     recover_bits_from_packed_shape,
     write_config,
 )
-from .model_adapters import FlintAdapter, LFM2Adapter, get, register, ModelAdapter
+from .adapters import (
+    ModelAdapter,
+    DefaultAdapter,
+    FlintAdapter,
+    LFM2Adapter,
+    LFM2MoEAdapter,
+    OLMoEAdapter,
+    Qwen3NextMoEAdapter,
+    get,
+    register,
+)
 from .objective import (
     MLX_SUPPORTED_BITS,
     MLX_SUPPORTED_GROUP_SIZES,
@@ -89,8 +99,12 @@ __all__ = [
     "recover_bits_from_packed_shape",
     # adapters
     "ModelAdapter",
+    "DefaultAdapter",
     "FlintAdapter",
     "LFM2Adapter",
+    "LFM2MoEAdapter",
+    "OLMoEAdapter",
+    "Qwen3NextMoEAdapter",
     "get",
     "register",
     # validation
